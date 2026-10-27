@@ -172,3 +172,19 @@ def test_single_order_tree_passes_through_without_router():
 
     # The absent router must not be exported.
     assert all(name != "router" for name, _ in model.export_modules())
+
+
+def test_forward_under_autocast_keeps_global_buffers_fp32(moe):
+    """AMP makes expert logits bf16/fp16; the global scatter buffer (built
+    from x's dtype) must absorb them without an index_put dtype error."""
+    x = torch.randn(2, 3, 224, 224)
+    targets = {
+        "order": torch.tensor([0, 1]),
+        "family": torch.tensor([0, 2]),   # Carabidae / Nymphalidae
+        "genus": torch.tensor([0, 3]),    # Carabus / Vanessa
+        "species": torch.tensor([0, 4]),  # Carabus auratus / Vanessa atalanta
+    }
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        out = moe(x, targets)
+    for level in ("family", "genus", "species"):
+        assert out[level].dtype == torch.float32, level

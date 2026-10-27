@@ -231,8 +231,10 @@ class HierarchicalMoE(nn.Module):
                 [self._local_to_global[level][key][j] for j in range(logits.shape[1])],
                 device=x.device,
             )
-            # Scatter every local logit to its global class position.
-            out[idx[:, None], gidx[None, :]] = logits
+            # Scatter every local logit to its global class position. Under AMP
+            # the expert runs in half precision while the buffer follows x's
+            # dtype: cast so index_put sees matching dtypes.
+            out[idx[:, None], gidx[None, :]] = logits.to(out.dtype)
         # Pass-through parents: logit 0 on their single child.
         for i, p in enumerate(parent_global.tolist()):
             parent = parent_list[int(p)]
