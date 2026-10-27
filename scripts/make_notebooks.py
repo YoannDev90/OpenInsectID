@@ -153,7 +153,7 @@ from src.data_pipeline import ImageDownloader
 downloader = ImageDownloader(dl_cfg)
 # Small test slice: only the first SMALL_N records are downloaded.
 # Raise it (or use records directly) for a real run.
-SMALL_N = 40
+SMALL_N = 10
 result = downloader.download_sync(records[:SMALL_N])
 print(f"from {SMALL_N} records -> ok={result.ok} failed={result.failed} skipped(dup)={result.skipped}")
 '''
@@ -262,7 +262,7 @@ if not Path(MANIFEST).exists():
     IMAGE_ROOT = "data/raw"
 
 train_loader, val_loader, tree = build_dataloaders(
-    MANIFEST, IMAGE_ROOT, batch_size=cfg.batch_size if hasattr(cfg, "batch_size") else 128,
+    MANIFEST, IMAGE_ROOT, batch_size=128,
     val_fraction=0.1, num_workers=2,
     transform=train_transform(image_size=224), seed=42,
 )

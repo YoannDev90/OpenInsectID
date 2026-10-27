@@ -120,12 +120,18 @@ def build_dataloaders(
 
     ds = InsectDataset(manifest_path, image_root, tree=tree, transform=transform)
     n_val = int(len(ds) * val_fraction)
+    if len(ds) > 1:
+        # Always keep >=1 val row and >=1 train row on tiny (smoke-test) sets.
+        n_val = min(max(n_val, 1), len(ds) - 1)
     n_train = len(ds) - n_val
     generator = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=generator)
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, collate_fn=_collate, drop_last=True,
+        num_workers=num_workers, collate_fn=_collate,
+        # Never drop the only batch: with fewer samples than batch_size,
+        # drop_last=True would yield an empty loader and train nothing.
+        drop_last=len(train_ds) > batch_size,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
