@@ -67,9 +67,45 @@ def test_trainer_one_epoch_on_tiny_manifest(tmp_path):
         epochs=1, device="cpu", use_amp=False, mixup_alpha=0.0, log_every=1,
     )
     trainer = Trainer(model, cfg)
+    # The plain loss path and the mixup path must share one cost matrix
+    # (otherwise lambda_cost is silently dropped on non-mixup batches), and
+    # its buffers must follow the model to the training device.
+    assert trainer.loss_fn.cost_matrix is trainer.cost_matrix
+    assert trainer.cost_matrix.paths.device == trainer.device
     history = trainer.fit(train_loader, val_loader)
 
     assert history["train"] and history["val"]
     tr = history["train"][0]
     assert tr.loss > 0  # loss averaged over at least one real batch
     assert 0.0 <= tr.acc_species <= 1.0
+
+
+def test_step_loss_mixup_path_costs_and_backprops(tmp_path):
+    """The mixup branch calls the cost matrix directly (this is where the
+    Kaggle CUDA run crashed); it must share the wired matrix and backprop."""
+    import torch
+
+    from src.models import HierarchicalMoE
+    from src.training import (
+        Trainer, TrainConfig, build_dataloaders, train_transform,
+    )
+
+    mpath, root = _write_tiny_manifest(tmp_path, n=8)
+    train_loader, _, tree = build_dataloaders(
+        mpath, root, batch_size=8, val_fraction=0.25,
+        num_workers=0, transform=train_transform(image_size=224), seed=0,
+    )
+    model = HierarchicalMoE(tree, backbone_name="mnv4_small")
+    cfg = TrainConfig(
+        epochs=1, device="cpu", use_amp=False,
+        mixup_alpha=0.4, mixup_prob=1.0, log_every=1,  # force the mixup branch
+    )
+    trainer = Trainer(model, cfg)
+    assert trainer.loss_fn.cost_matrix is trainer.cost_matrix
+
+    batch = next(iter(train_loader))
+    model.train()
+    loss, _ = trainer._step_loss(batch["image"], trainer._targets(batch))
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+    loss.backward()

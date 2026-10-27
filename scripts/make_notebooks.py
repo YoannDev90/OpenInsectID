@@ -233,7 +233,7 @@ import torch
 
 from src.models import HierarchicalMoE, TaxonomyTree
 from src.training import (
-    Trainer, TrainConfig, CombinedTaxonomicLoss,
+    Trainer, TrainConfig,
     train_transform, eval_transform, build_dataloaders,
 )
 
@@ -281,12 +281,6 @@ print(f"MoE parameters: {n_params/1e6:.2f}M across "
       f"{len(model.family_experts)} family experts, "
       f"{len(model.genus_experts)} genus experts, "
       f"{len(model.species_experts)} species experts")
-
-loss_fn = CombinedTaxonomicLoss(
-    level_weights=cfg.level_weights, focal_gamma=cfg.focal_gamma,
-    focal_alpha=cfg.focal_alpha, lambda_cost=cfg.lambda_cost,
-)
-loss_fn.build_cost_matrix(model)
 '''
         ),
         md(

@@ -80,6 +80,13 @@ class Trainer:
             focal_alpha=config.focal_alpha,
             lambda_cost=config.lambda_cost,
         )
+        # Both loss paths share ONE matrix: the mixup branch calls
+        # self.cost_matrix directly, the plain branch goes through loss_fn
+        # (whose own matrix would otherwise stay None and silently drop the
+        # lambda_cost term). Move it with the model so buffers follow to CUDA.
+        self.loss_fn.cost_matrix = self.cost_matrix
+        self.loss_fn.to(self.device)
+        self.cost_matrix.to(self.device)
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.lr, weight_decay=config.weight_decay
         )
