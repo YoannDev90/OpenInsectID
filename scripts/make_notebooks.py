@@ -45,28 +45,43 @@ GITHUB_REPO = os.environ.get("OPENINSECT_REPO", "https://github.com/YoannDev90/O
 # ---------------------------------------------------------------------------
 IS_KAGGLE = os.path.exists("/kaggle/input")
 
-# Walk up from the working directory to find the repo root: works whether the
-# kernel starts in the repo, in a notebook subfolder, or not at all.
-repo_root = os.getcwd()
-while repo_root != os.path.dirname(repo_root) and not os.path.isdir(os.path.join(repo_root, "src")):
-    repo_root = os.path.dirname(repo_root)
-in_checkout = os.path.isdir(os.path.join(repo_root, "src"))
+def _is_our_checkout(path):
+    # Identify OUR repo precisely: any folder happening to contain a src/
+    # (cwd leftovers, /kaggle, ...) must not be mistaken for the checkout.
+    return (os.path.isfile(os.path.join(path, "pyproject.toml"))
+            and os.path.isdir(os.path.join(path, "src", "data_pipeline")))
 
-if not in_checkout:
-    # Fresh Kaggle kernel (or any cwd outside the checkout): install the
-    # package straight from GitHub. pip needs the `git+` prefix to clone --
-    # without it GitHub serves the HTML page and pip fails with
-    # "cannot detect archive format".
+# Walk up from cwd (kernels start in /kaggle/working, Jupyter in the notebook
+# folder) to the repo root; anywhere else means: install from GitHub.
+repo_root = os.getcwd()
+while not _is_our_checkout(repo_root):
+    parent = os.path.dirname(repo_root)
+    if parent == repo_root:
+        break
+    repo_root = parent
+in_checkout = _is_our_checkout(repo_root)
+
+if in_checkout:
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+else:
+    # pip needs the `git+` prefix to clone -- a plain https URL makes GitHub
+    # serve the HTML page and pip fails with "cannot detect archive format".
     install_url = GITHUB_REPO
     if install_url.startswith(("http://", "https://")) and not install_url.startswith("git+"):
         install_url = "git+" + install_url
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", install_url])
-elif repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
+
+try:
+    import src.data_pipeline  # noqa: F401 - fail fast, with context, if shadowed
+except ModuleNotFoundError:
+    print("DIAG sys.path:", sys.path)
+    raise
 
 from pathlib import Path
 import yaml
 
+print(f"cwd={os.getcwd()} checkout={in_checkout} repo_root={repo_root}")
 print("package ready; importable as `src.*`")
 """
 
