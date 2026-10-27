@@ -198,4 +198,6 @@ class GBIFExtractor:
         return records
 
     def extract_sync(self, **kwargs) -> list[OccurrenceRecord]:
-        return asyncio.run(self.extract(**kwargs))
+        from ._compat import run_async
+
+        return run_async(self.extract(**kwargs))

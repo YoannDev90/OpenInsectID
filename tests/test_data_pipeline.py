@@ -178,3 +178,57 @@ def test_gbif_params_filters():
     assert params["mediaType"] == "StillImage"
     assert params["occurrenceStatus"] == "PRESENT"
     assert "HUMAN_OBSERVATION" in params["basisOfRecord"]
+
+
+# ------------------------------------------- sync wrappers inside Jupyter
+# ipykernel runs an event loop in the calling thread, so asyncio.run() would
+# raise "cannot be called from a running event loop". The *_sync wrappers must
+# work there too -- that is where the Kaggle notebooks execute.
+
+
+def test_run_async_nested_in_running_loop():
+    import asyncio
+
+    from src.data_pipeline._compat import run_async
+
+    async def inner():
+        return 42
+
+    async def outer():
+        return run_async(inner())
+
+    assert asyncio.run(outer()) == 42
+
+
+def test_extract_sync_inside_running_loop(monkeypatch):
+    import asyncio
+
+    ex = GBIFExtractor()
+
+    async def fake_extract(**kwargs):
+        return ["record"]
+
+    monkeypatch.setattr(ex, "extract", fake_extract)
+
+    async def call_from_loop():
+        return ex.extract_sync(max_records=1)
+
+    assert asyncio.run(call_from_loop()) == ["record"]
+
+
+def test_download_sync_inside_running_loop(monkeypatch):
+    import asyncio
+
+    from src.data_pipeline.downloader import DownloadResult
+
+    dl = ImageDownloader(DownloadConfig())
+
+    async def fake_download(records, session):
+        return DownloadResult(ok=3)
+
+    monkeypatch.setattr(dl, "download_records", fake_download)
+
+    async def call_from_loop():
+        return dl.download_sync([])
+
+    assert asyncio.run(call_from_loop()).ok == 3

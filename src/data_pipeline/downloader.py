@@ -145,4 +145,6 @@ class ImageDownloader:
         return self._results
 
     def download_sync(self, records) -> DownloadResult:
-        return asyncio.run(self.download_records(records, None))
+        from ._compat import run_async
+
+        return run_async(self.download_records(records, None))

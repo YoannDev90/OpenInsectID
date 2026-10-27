@@ -38,6 +38,7 @@ SETUP = """\
 
 INSTALL = """\
 import os, subprocess, sys
+from pathlib import Path
 
 # --- Configure this to your repo -------------------------------------------
 GITHUB_REPO = os.environ.get("OPENINSECT_REPO", "https://github.com/YoannDev90/OpenInsectID.git")
@@ -46,7 +47,12 @@ IS_KAGGLE = os.path.exists("/kaggle/input")
 
 if IS_KAGGLE and "OpenInsectID" not in os.getcwd():
     # Install the package straight from GitHub on a fresh Kaggle kernel.
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", GITHUB_REPO])
+    # pip needs the `git+` prefix to clone: without it GitHub serves the HTML
+    # page and pip fails with "cannot detect archive format".
+    install_url = GITHUB_REPO
+    if install_url.startswith(("http://", "https://")) and not install_url.startswith("git+"):
+        install_url = "git+" + install_url
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", install_url])
 else:
     # Local dev: ensure the repo root is importable.
     repo_root = os.getcwd()
@@ -127,9 +133,11 @@ print("Uncomment to run DuckDB spatial cleaning on a full GBIF dump.")
 from src.data_pipeline import ImageDownloader
 
 downloader = ImageDownloader(dl_cfg)
-# result = downloader.download_sync(records)
-# print(f"ok={result.ok} failed={result.failed} skipped(dup)={result.skipped}")
-print("Uncomment to download images into data/raw/{order}/{family}/{genus}/{species}/")
+# Small test slice: only the first SMALL_N records are downloaded.
+# Raise it (or use records directly) for a real run.
+SMALL_N = 40
+result = downloader.download_sync(records[:SMALL_N])
+print(f"from {SMALL_N} records -> ok={result.ok} failed={result.failed} skipped(dup)={result.skipped}")
 '''
         ),
         md("## 4. Curation (integrity / resolution / aspect ratio)"),
@@ -137,13 +145,12 @@ print("Uncomment to download images into data/raw/{order}/{family}/{genus}/{spec
             '''\
 from src.data_pipeline import curate_directory
 
-# verdicts = curate_directory("data/raw", cur_cfg)
-# ok = sum(v.ok for v in verdicts)
-# print(f"{ok}/{len(verdicts)} images pass curation")
-# for v in verdicts:
-#     if not v.ok:
-#         print("  drop:", v.path, "->", v.reason)
-print("Uncomment to run automated curation over data/raw.")
+verdicts = curate_directory("data/raw", cur_cfg)
+ok = sum(v.ok for v in verdicts)
+print(f"{ok}/{len(verdicts)} images pass curation")
+for v in verdicts:
+    if not v.ok:
+        print("  drop:", v.path, "->", v.reason)
 '''
         ),
         md(
@@ -151,20 +158,35 @@ print("Uncomment to run automated curation over data/raw.")
 
 Write a Parquet manifest consumed by the training notebook. Schema:
 `image_path, order, family, genus, species` (+ optional `h3_cell, lat, lon`).
-On Kaggle, push this as a Dataset so notebook 02 can attach it as input.
+Lineage is re-derived from the curated file tree. On Kaggle, push this as a
+Dataset so notebook 02 can attach it as input.
 """
         ),
         code(
             '''\
 import polars as pl
+from pathlib import Path
 
-# Build a manifest DataFrame from your curated records, then:
-# manifest.write_parquet("insectid_manifest.parquet")
+RAW = Path("data/raw")
+schema = ["image_path", "order", "family", "genus", "species"]
+rows = []
+for v in verdicts:
+    if not v.ok:
+        continue
+    parts = Path(v.path).relative_to(RAW).parts  # order/family/genus/species/hash.jpg
+    if len(parts) == 5:
+        o, f, g, s = parts[:4]
+        rows.append({"image_path": "/".join(parts), "order": o,
+                     "family": f, "genus": g, "species": s})
+
+manifest = pl.DataFrame(rows, schema={c: pl.Utf8 for c in schema})
+manifest.write_parquet("insectid_manifest.parquet")
+print(f"manifest: {manifest.height} curated rows -> insectid_manifest.parquet")
 # If running on Kaggle, publish manifest + images into the curated dataset
 # (folder must hold dataset-metadata.json with id yoanndev90/open-insect-id-v2):
 #   !kaggle datasets version -m "curated run" -p <dataset-folder> --dir-mode tar
 # notebook 02 already attaches that dataset as an input.
-print("Manifest schema:", ["image_path", "order", "family", "genus", "species"])
+manifest.head(5)
 '''
         ),
     ]
