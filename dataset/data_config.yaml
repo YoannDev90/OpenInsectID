@@ -1,0 +1,55 @@
+# GBIF acquisition + curation configuration
+# All paths are relative to the working directory (on Kaggle: /kaggle/working).
+
+gbif:
+  # World-scale Insecta download (classKey 216 = Insecta)
+  class_key: 216
+  occurrence_status: PRESENT
+  basis_of_record:
+    - HUMAN_OBSERVATION
+    - PRESERVED_SPECIMEN
+    - MACHINE_OBSERVATION
+  has_coordinate: true
+  has_multimedia: true
+  # GBIF data-quality issues to exclude
+  excluded_issues:
+    - COORDINATE_INVALID
+    - ZERO_COORDINATE
+    - COUNTRY_COORDINATE_MISMATCH
+    - RECORDED_DATE_UNLIKELY
+  # Email required by the GBIF download API
+  email: "your-email@example.com"
+
+spatial:
+  # Uber H3 resolution: 4 (~1770 km² cells) or 5 (~252 km² cells)
+  h3_resolution: 4
+  # A (species, H3 cell) pair needs at least this many occurrences
+  # to be considered part of the species range mask.
+  min_occurrences_per_cell: 3
+
+images:
+  # Async downloader
+  concurrency: 8
+  requests_per_second_per_domain: 2.0
+  max_retries: 3
+  timeout_seconds: 30
+  # Stored as data/raw/{order}/{family}/{genus}/{species}/{hash}.jpg
+  raw_root: "data/raw"
+
+curation:
+  min_size: 224          # reject if min(h, w) < 224
+  max_aspect_ratio: 3.0  # reject if max(h,w)/min(h,w) above this
+  quarantine_dir: "data/quarantine"
+
+balance:
+  # Long-tail strategy: cap images per species (undersampling)
+  max_images_per_species: 500
+  seed: 42
+
+manifest:
+  # Intermediate artifacts
+  occurrences_parquet: "data/occurrences_clean.parquet"
+  presence_mask_parquet: "data/presence_mask.parquet"
+  images_manifest_parquet: "data/images_manifest.parquet"
+  curated_manifest_parquet: "data/images_manifest_curated.parquet"
+  balanced_manifest_parquet: "data/images_manifest_balanced.parquet"

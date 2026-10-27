@@ -1,0 +1,86 @@
+{
+  "title": "Open Insect ID v2",
+  "subtitle": "Curated GBIF insect photos for hierarchical MoE training",
+  "description": "A curated dataset of insect photographs sourced from global **GBIF** occurrence records, cleaned and balanced for training a **hierarchical Vision Mixture-of-Experts** classifier (Order → Family → Genus → Species).\n\n**Status:** schema + documentation first; image records are added as the pipeline notebook (`01-data-pipeline`) is run. Source code and notebooks: https://github.com/YoannDev90/OpenInsectID\n\n## Sourcing\n\n- GBIF Occurrence API / bulk dump, Insecta (`classKey=216`)\n- `mediaType=StillImage`, `occurrenceStatus=PRESENT`\n- `basisOfRecord`: HUMAN_OBSERVATION, PRESERVED_SPECIMEN (iNaturalist validations, museum specimens)\n- Excluded data-quality issues: COORDINATE_INVALID, ZERO_COORDINATE, COUNTRY_COORDINATE_MISMATCH, RECORDED_DATE_UNLIKELY\n\n## Cleaning\n\n1. DuckDB streaming over the raw dump (RAM-safe, column projection, complete-lineage only)\n2. Uber H3 presence masks (resolution 4): records outside a species' known range are flagged as spatial outliers and dropped\n3. Visual curation: corrupt files, images below 224×224, aspect ratio beyond 3:1 rejected\n4. URL + content-hash de-duplication during async download\n\n## Schema\n\nOne row per curated image (Parquet) — columns documented in `manifest_schema.csv`.\n\n## Reproduce\n\n- Kaggle notebook `01-data-pipeline` performs ingestion → spatial cleaning → download → curation → manifest export\n- Exact query filters and thresholds: `data_config.yaml`\n\n## License & attribution\n\nImages remain under their original GBIF/iNaturalist/museum licenses and creator terms. The curated set is published under **CC BY 4.0** and keeps `occurrence_id` + `media_url` per record so provenance is traceable.",
+  "id": "yoanndev90/open-insect-id-v2",
+  "licenses": [
+    {
+      "name": "Attribution 4.0 International (CC BY 4.0)"
+    }
+  ],
+  "keywords": [
+    "classification",
+    "research",
+    "python",
+    "beginner"
+  ],
+  "userSpecifiedSources": "GBIF — Global Biodiversity Information Facility occurrence records ([gbif.org](https://www.gbif.org)), each image retaining its original licence, creator terms and `occurrence_id` for attribution.",
+  "resources": [
+    {
+      "path": "README.md",
+      "description": "Dataset card: sourcing, cleaning, schema, license & attribution"
+    },
+    {
+      "path": "manifest_schema.csv",
+      "description": "Column schema of the curated manifest (header row; data rows appear once the pipeline is run)",
+      "schema": {
+        "fields": [
+          {
+            "name": "image_path",
+            "type": "string",
+            "description": "Relative path under the image root: {order}/{family}/{genus}/{species}/{sha256}.jpg"
+          },
+          {
+            "name": "order",
+            "type": "string",
+            "description": "Taxonomic order"
+          },
+          {
+            "name": "family",
+            "type": "string",
+            "description": "Taxonomic family"
+          },
+          {
+            "name": "genus",
+            "type": "string",
+            "description": "Taxonomic genus"
+          },
+          {
+            "name": "species",
+            "type": "string",
+            "description": "Species binomial"
+          },
+          {
+            "name": "h3_cell",
+            "type": "string",
+            "description": "Uber H3 cell id at the configured resolution (optional)"
+          },
+          {
+            "name": "lat",
+            "type": "decimal",
+            "description": "Occurrence latitude (optional)"
+          },
+          {
+            "name": "lon",
+            "type": "decimal",
+            "description": "Occurrence longitude (optional)"
+          },
+          {
+            "name": "occurrence_id",
+            "type": "string",
+            "description": "GBIF occurrence id for provenance (optional)"
+          },
+          {
+            "name": "media_url",
+            "type": "url",
+            "description": "Source image URL for attribution (optional)"
+          }
+        ]
+      }
+    },
+    {
+      "path": "data_config.yaml",
+      "description": "Exact GBIF query filters, H3 resolution and curation thresholds used to build the dataset"
+    }
+  ]
+}

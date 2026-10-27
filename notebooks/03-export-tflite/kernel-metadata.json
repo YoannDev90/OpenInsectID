@@ -1,5 +1,5 @@
 {
-  "id": "yoanndev90/03-export-tflite",
+  "id": "yoanndev90/open-insect-id-v2-export-onnx-int8-tflite",
   "title": "Open Insect ID v2 - Export ONNX INT8 TFLite",
   "code_file": "03-export-tflite.ipynb",
   "language": "python",

@@ -58,8 +58,8 @@ One row per curated image (Parquet):
 
 ## Reproduce
 
-See `notebooks/01_data_pipeline.ipynb`, which performs ingestion, spatial
-cleaning, download, curation, and manifest export.
+See `notebooks/01-data-pipeline/01-data-pipeline.ipynb`, which performs
+ingestion, spatial cleaning, download, curation, and manifest export.
 
 ## License & attribution
 

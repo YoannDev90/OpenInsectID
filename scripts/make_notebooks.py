@@ -3,6 +3,8 @@
 Run once: python scripts/make_notebooks.py
 """
 
+import re
+
 import nbformat as nbf
 from pathlib import Path
 
@@ -158,9 +160,10 @@ import polars as pl
 
 # Build a manifest DataFrame from your curated records, then:
 # manifest.write_parquet("insectid_manifest.parquet")
-# If running on Kaggle, publish with:
-#   !kaggle datasets create -p . --dir-mode tar
-# and attach it as an input dataset in notebook 02.
+# If running on Kaggle, publish manifest + images into the curated dataset
+# (folder must hold dataset-metadata.json with id yoanndev90/open-insect-id-v2):
+#   !kaggle datasets version -m "curated run" -p <dataset-folder> --dir-mode tar
+# notebook 02 already attaches that dataset as an input.
 print("Manifest schema:", ["image_path", "order", "family", "genus", "species"])
 '''
         ),
@@ -210,8 +213,8 @@ print("device:", device)
         code(
             '''\
 # On Kaggle, point these at your attached input dataset.
-MANIFEST = "/kaggle/input/insectid-dataset/insectid_manifest.parquet"
-IMAGE_ROOT = "/kaggle/input/insectid-dataset/images"
+MANIFEST = "/kaggle/input/open-insect-id-v2/insectid_manifest.parquet"
+IMAGE_ROOT = "/kaggle/input/open-insect-id-v2/images"
 
 from pathlib import Path
 if not Path(MANIFEST).exists():
@@ -282,7 +285,8 @@ print("saved:", list(p.name for p in out.iterdir()))
 
 # On Kaggle, publish the checkpoint directory as an output dataset so the
 # export notebook (03) can attach it:
-#   !kaggle datasets create -p checkpoints --dir-mode tar
+#   !kaggle datasets create -p checkpoints --dir-mode tar -u
+# (slug: yoanndev90/open-insect-id-checkpoints)
 '''
         ),
     ]
@@ -307,8 +311,8 @@ Android app. Attach the checkpoint output-dataset from notebook 02.
 import torch
 from src.models import HierarchicalMoE, TaxonomyTree
 
-CKPT = "/kaggle/input/insectid-checkpoints/moe_state.pt"
-TAX  = "/kaggle/input/insectid-checkpoints/taxonomy.json"
+CKPT = "/kaggle/input/open-insect-id-checkpoints/moe_state.pt"
+TAX  = "/kaggle/input/open-insect-id-checkpoints/taxonomy.json"
 if not Path(CKPT).exists():
     CKPT, TAX = "checkpoints/moe_state.pt", "checkpoints/taxonomy.json"
 
@@ -401,14 +405,21 @@ print("bundle:", list(p.name for p in bundle.iterdir()))
     return b
 
 
-def _kernel_metadata(slug: str, title: str, code_file: str, gpu: bool) -> dict:
+def _slugify(title: str) -> str:
+    """Kaggle derives a kernel's URL slug from its title (lowercase, dashes)."""
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", title.lower())).strip("-")
+
+
+def _kernel_metadata(title: str, code_file: str, gpu: bool, inputs: list) -> dict:
     """kernel-metadata.json for `kaggle kernels push -p <folder>`.
 
     enable_internet must be true: the notebooks pip-install this package from
-    GitHub in their setup cell. Kernels are created private by default.
+    GitHub in their setup cell. The id must match the title-derived slug,
+    otherwise the CLI warns and a re-push risks forking a second kernel.
+    Kernels are created private by default.
     """
     return {
-        "id": f"yoanndev90/{slug}",
+        "id": f"yoanndev90/{_slugify(title)}",
         "title": title,
         "code_file": code_file,
         "language": "python",
@@ -417,7 +428,7 @@ def _kernel_metadata(slug: str, title: str, code_file: str, gpu: bool) -> dict:
         "enable_gpu": "true" if gpu else "false",
         "enable_internet": "true",
         "machine_shape": "",
-        "dataset_sources": [],
+        "dataset_sources": inputs,
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
@@ -431,16 +442,19 @@ def main():
             lambda: build_pipeline_nb(),
             "Open Insect ID v2 - Data Pipeline",
             False,
+            [],
         ),
         "02-train-moe": (
             lambda: build_train_nb(),
             "Open Insect ID v2 - Train Vision MoE",
             True,
+            ["yoanndev90/open-insect-id-v2"],
         ),
         "03-export-tflite": (
             lambda: build_export_nb(),
             "Open Insect ID v2 - Export ONNX INT8 TFLite",
             False,
+            [],
         ),
     }
 
@@ -448,7 +462,7 @@ def main():
     for old in NB_DIR.glob("*.ipynb"):
         old.unlink()
 
-    for slug, (builder, title, gpu) in kernels.items():
+    for slug, (builder, title, gpu, inputs) in kernels.items():
         folder = NB_DIR / slug
         folder.mkdir(parents=True, exist_ok=True)
         b = builder()
@@ -464,7 +478,7 @@ def main():
         import json
 
         (folder / "kernel-metadata.json").write_text(
-            json.dumps(_kernel_metadata(slug, title, code_file, gpu), indent=2)
+            json.dumps(_kernel_metadata(title, code_file, gpu, inputs), indent=2)
         )
         print("wrote", folder / code_file, "+ kernel-metadata.json")
 

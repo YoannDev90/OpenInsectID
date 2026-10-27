@@ -102,17 +102,21 @@ python -m venv .venv && .venv/bin/pip install -e ".[test]"
 
 ### Run on Kaggle (the intended workflow)
 
-The notebooks under `notebooks/` are the executable entry points:
+Each folder under `notebooks/` is one pushable Kaggle kernel (notebook +
+`kernel-metadata.json`):
 
 | Notebook | Purpose | Accelerator |
 |----------|---------|-------------|
-| `01_data_pipeline.ipynb` | GBIF ingest → DuckDB/H3 clean → async download → curation → manifest | CPU |
-| `02_train_moe.ipynb` | build tree → MoE + loss → train (± distillation) → checkpoints | **GPU** |
-| `03_export_tflite.ipynb` | load checkpoints → per-module ONNX → INT8 → `.tflite` bundle | CPU |
+| `01-data-pipeline.ipynb` | GBIF ingest → DuckDB/H3 clean → async download → curation → manifest | CPU |
+| `02-train-moe.ipynb` | build tree → MoE + loss → train (± distillation) → checkpoints | **GPU** |
+| `03-export-tflite.ipynb` | load checkpoints → per-module ONNX → INT8 → `.tflite` bundle | CPU |
 
-Each notebook installs the package from GitHub (`GITHUB_REPO` at the top of
-`01`). To run end-to-end, attach the manifest/image/checkpoint artifacts
-produced by one notebook as an input dataset to the next.
+Each notebook installs the package from GitHub in its setup cell
+(`GITHUB_REPO`). Artifacts flow through the public dataset
+[yoanndev90/open-insect-id-v2](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-v2):
+notebook `01` publishes the curated manifest/images there, `02` already
+attaches it as an input, and `03` attaches the checkpoint dataset published by
+`02` (created on the first training run).
 
 ### Use as a library
 
