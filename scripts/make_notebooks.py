@@ -38,7 +38,7 @@ INSTALL = """\
 import os, subprocess, sys
 
 # --- Configure this to your repo -------------------------------------------
-GITHUB_REPO = os.environ.get("OPENINSECT_REPO", "https://github.com/<you>/OpenInsectID.git")
+GITHUB_REPO = os.environ.get("OPENINSECT_REPO", "https://github.com/YoannDev90/OpenInsectID.git")
 # ---------------------------------------------------------------------------
 IS_KAGGLE = os.path.exists("/kaggle/input")
 
@@ -401,22 +401,72 @@ print("bundle:", list(p.name for p in bundle.iterdir()))
     return b
 
 
-def main():
-    nbs = {
-        "01_data_pipeline.ipynb": build_pipeline_nb(),
-        "02_train_moe.ipynb": build_train_nb(),
-        "03_export_tflite.ipynb": build_export_nb(),
+def _kernel_metadata(slug: str, title: str, code_file: str, gpu: bool) -> dict:
+    """kernel-metadata.json for `kaggle kernels push -p <folder>`.
+
+    enable_internet must be true: the notebooks pip-install this package from
+    GitHub in their setup cell. Kernels are created private by default.
+    """
+    return {
+        "id": f"yoanndev90/{slug}",
+        "title": title,
+        "code_file": code_file,
+        "language": "python",
+        "kernel_type": "notebook",
+        "is_private": "true",
+        "enable_gpu": "true" if gpu else "false",
+        "enable_internet": "true",
+        "machine_shape": "",
+        "dataset_sources": [],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
     }
-    for name, b in nbs.items():
+
+
+def main():
+    # slug -> (builder, human title, needs GPU)
+    kernels = {
+        "01-data-pipeline": (
+            lambda: build_pipeline_nb(),
+            "Open Insect ID v2 - Data Pipeline",
+            False,
+        ),
+        "02-train-moe": (
+            lambda: build_train_nb(),
+            "Open Insect ID v2 - Train Vision MoE",
+            True,
+        ),
+        "03-export-tflite": (
+            lambda: build_export_nb(),
+            "Open Insect ID v2 - Export ONNX INT8 TFLite",
+            False,
+        ),
+    }
+
+    # Drop any stale flat notebooks from the previous layout.
+    for old in NB_DIR.glob("*.ipynb"):
+        old.unlink()
+
+    for slug, (builder, title, gpu) in kernels.items():
+        folder = NB_DIR / slug
+        folder.mkdir(parents=True, exist_ok=True)
+        b = builder()
         b.metadata["kernelspec"] = {
             "display_name": "Python 3",
             "language": "python",
             "name": "python3",
         }
         b.metadata["language_info"] = {"name": "python", "version": "3.10"}
-        path = NB_DIR / name
-        nbf.write(b, path)
-        print("wrote", path)
+
+        code_file = f"{slug}.ipynb"
+        nbf.write(b, folder / code_file)
+        import json
+
+        (folder / "kernel-metadata.json").write_text(
+            json.dumps(_kernel_metadata(slug, title, code_file, gpu), indent=2)
+        )
+        print("wrote", folder / code_file, "+ kernel-metadata.json")
 
 
 if __name__ == "__main__":
