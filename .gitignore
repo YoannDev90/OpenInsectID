@@ -24,3 +24,6 @@ checkpoints/
 .DS_Store
 .idea/
 .vscode/
+
+# Local engineering plan (not published)
+PLAN.md

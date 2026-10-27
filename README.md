@@ -13,29 +13,48 @@ A single softmax over tens of thousands of insect species is dominated by the
 long tail and forces every image through one giant classifier. Instead we route
 each image down a cascade of small specialists:
 
-```
-              [image]
-                 │
-      ┌──────────▼──────────┐   confidence < τ₁ → keep Top-2 orders
-      │  L1 router (order)   │ ───────────────────────────────────┐
-      └──────────┬──────────┘                                     │
-        ┌────────┴────────┐                                       ▼
-   ┌────▼────┐       ┌────▼────┐                            (uncertainty
-   │ family  │       │ family  │   …two candidate paths, weighted by L1 prob
-   │ expert A│       │ expert B│
-   └────┬────┘       └────┬────┘
-        └────────┬────────┘
-           ┌─────▼─────┐
-           │ genus expert│   per-level threshold τ_level
-           └─────┬─────┘
-           ┌─────▼──────┐
-           │species expert│  → deepest accepted level = the answer
-           └─────────────┘
+```mermaid
+flowchart TD
+    IMG([Image])
+
+    subgraph L1["Level 1 — Order router"]
+        R[L1 router<br/>order classifier]
+    end
+
+    subgraph L2["Level 2 — Family experts"]
+        FA[Family expert A]
+        FB[Family expert B]
+    end
+
+    subgraph L3["Level 3 — Genus expert"]
+        G[Genus expert<br/>τ_level check]
+    end
+
+    subgraph L4["Level 4 — Species micro-expert"]
+        S[Species expert<br/>τ_level check]
+    end
+
+    AMB[Two candidate paths<br/>weighted by L1 probability]
+    UNC[Order-level<br/>uncertainty]
+    ANSWER([Deepest accepted level = the answer])
+
+    IMG --> R
+    R -->|confidence &ge; τ₁ — Top-1| FA
+    R -.->|confidence &lt; τ₁ — keep Top-2 orders| AMB
+    R -.->|entropy &gt; τ_level| UNC
+    AMB -.-> FA
+    AMB -.-> FB
+    FA --> G
+    FB --> G
+    G --> S
+    S --> ANSWER
 ```
 
 Each expert only discriminates between **siblings**, so sub-problems stay small
 and edge-friendly. A confidence/entropy check at every level lets the pipeline
-stop early and return the deepest *certain* taxon instead of guessing.
+stop early and return the deepest *certain* taxon instead of guessing — the
+`-.-` edges above are the fallback paths (Top-2 order routing and early
+rejection) that make the cascade robust to a wrong first guess.
 
 ## Repository layout
 
