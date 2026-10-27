@@ -232,3 +232,14 @@ def test_download_sync_inside_running_loop(monkeypatch):
         return dl.download_sync([])
 
     assert asyncio.run(call_from_loop()).ok == 3
+
+
+def test_gbif_query_repeats_basis_of_record():
+    """GBIF400s on comma-joined enums: the key must repeat instead."""
+    ex = GBIFExtractor()
+    q = ex._query(0)
+    bor = [v for k, v in q if k == "basisOfRecord"]
+    assert bor == ["HUMAN_OBSERVATION", "PRESERVED_SPECIMEN"]
+    assert all("," not in v for v in bor)
+    assert ("classKey", "216") in q
+    assert ("limit", "300") in q

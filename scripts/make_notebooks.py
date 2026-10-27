@@ -45,21 +45,24 @@ GITHUB_REPO = os.environ.get("OPENINSECT_REPO", "https://github.com/YoannDev90/O
 # ---------------------------------------------------------------------------
 IS_KAGGLE = os.path.exists("/kaggle/input")
 
-if IS_KAGGLE and "OpenInsectID" not in os.getcwd():
-    # Install the package straight from GitHub on a fresh Kaggle kernel.
-    # pip needs the `git+` prefix to clone: without it GitHub serves the HTML
-    # page and pip fails with "cannot detect archive format".
+# Walk up from the working directory to find the repo root: works whether the
+# kernel starts in the repo, in a notebook subfolder, or not at all.
+repo_root = os.getcwd()
+while repo_root != os.path.dirname(repo_root) and not os.path.isdir(os.path.join(repo_root, "src")):
+    repo_root = os.path.dirname(repo_root)
+in_checkout = os.path.isdir(os.path.join(repo_root, "src"))
+
+if not in_checkout:
+    # Fresh Kaggle kernel (or any cwd outside the checkout): install the
+    # package straight from GitHub. pip needs the `git+` prefix to clone --
+    # without it GitHub serves the HTML page and pip fails with
+    # "cannot detect archive format".
     install_url = GITHUB_REPO
     if install_url.startswith(("http://", "https://")) and not install_url.startswith("git+"):
         install_url = "git+" + install_url
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", install_url])
-else:
-    # Local dev: ensure the repo root is importable.
-    repo_root = os.getcwd()
-    if not os.path.isdir(os.path.join(repo_root, "src")):
-        repo_root = str(Path(GITHUB_REPO.split(".git")[0]).parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+elif repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from pathlib import Path
 import yaml

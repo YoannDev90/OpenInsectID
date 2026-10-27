@@ -77,15 +77,32 @@ class GBIFExtractor:
             "offset": offset,
         }
         if c.basis_of_record:
-            params["basisOfRecord"] = ",".join(c.basis_of_record)
+            bor = c.basis_of_record
+            # GBIF rejects comma-joined values on this filter (HTTP 400
+            # "Cannot parse ..."): keep a sequence so _query repeats the key.
+            params["basisOfRecord"] = (bor,) if isinstance(bor, str) else tuple(bor)
         if c.country:
             params["country"] = c.country
         return params
 
+    def _query(self, offset: int) -> list[tuple[str, str]]:
+        """Flatten ``_params`` into repeated key/value pairs for aiohttp.
+
+        Sequence values become one pair per element, e.g. two ``basisOfRecord``
+        entries -- the only encoding GBIF accepts for multi-valued filters.
+        """
+        query: list[tuple[str, str]] = []
+        for key, value in self._params(offset).items():
+            if isinstance(value, (list, tuple)):
+                query.extend((key, str(v)) for v in value)
+            else:
+                query.append((key, str(value)))
+        return query
+
     async def _fetch_page(self, session, offset: int) -> dict:
         import aiohttp
 
-        params = self._params(offset)
+        params = self._query(offset)
         last_err: Exception | None = None
         for attempt in range(self.config.max_retries):
             try:
