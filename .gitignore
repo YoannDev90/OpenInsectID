@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data (never commit raw GBIF data or images)
+data/
+*.zip
+*.tsv.gz
+*.parquet
+
+# Model artifacts
+runs/
+checkpoints/
+*.onnx
+*.tflite
+*.pt
+*.pth
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

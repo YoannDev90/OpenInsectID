@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-insect-id"
+version = "2.0.0"
+description = "Hierarchical Vision MoE for on-device insect identification (GBIF-trained, TFLite-exported)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.6",
+    "numpy>=1.26",
+    "pillow>=10.3",
+    "requests>=2.31",
+    "aiohttp>=3.9",
+    "polars>=1.0",
+    "duckdb>=1.0",
+    "h3>=4.0",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+export = ["onnx>=1.16", "onnxruntime>=1.18"]
+test = ["pytest>=8.0"]
+
+[tool.setuptools]
+# Make `src` the importable root package: `from src.models import ...`.
+packages = [
+    "src",
+    "src.models",
+    "src.training",
+    "src.export",
+    "src.data_pipeline",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

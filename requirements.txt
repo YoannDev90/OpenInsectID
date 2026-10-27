@@ -1,0 +1,20 @@
+# Core (models + training)
+torch>=2.6
+numpy>=1.26
+pillow>=10.3
+
+# Data pipeline
+requests>=2.31
+aiohttp>=3.9
+polars>=1.0
+duckdb>=1.0
+h3>=4.0
+tqdm>=4.66
+pyyaml>=6.0
+
+# Export
+onnx>=1.16
+onnxruntime>=1.18
+
+# Tests
+pytest>=8.0
