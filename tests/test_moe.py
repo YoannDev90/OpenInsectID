@@ -133,3 +133,42 @@ def test_passthrough_single_child():
     res = m.route(torch.randn(3, 224, 224), tau_order=0.0, tau_levels=(0,) * 4)
     # Cascade should still reach species via pass-through.
     assert any(p.level == "genus" for p in res.path)
+
+
+# --------------------------------------------------- single-order (smoke) tree
+
+SINGLE_ORDER_RECORDS = [
+    ("Lepidoptera", "Geometridae", "Agriopis", "Agriopis marginaria"),
+    ("Lepidoptera", "Hesperiidae", "Autochton", "Autochton neis"),
+    ("Lepidoptera", "Hesperiidae", "Anthoptus", "Anthoptus epictetus"),
+    ("Lepidoptera", "Nymphalidae", "Anthanassa", "Anthanassa drusilla"),
+]
+
+
+def test_single_order_tree_passes_through_without_router():
+    """One order (tiny e2e manifest) must not try to build a 1-class router."""
+    tree = TaxonomyTree(SINGLE_ORDER_RECORDS)
+    model = HierarchicalMoE(tree, backbone_name="mnv4_small", width_mult=0.25)
+    assert model.router is None
+    assert model.n_orders == 1
+
+    # Training forward: constant pass-through logits at the order level.
+    x = torch.randn(2, 3, 224, 224)
+    targets = {
+        "order": torch.zeros(2, dtype=torch.long),
+        "family": torch.tensor([0, 1]),
+        "genus": torch.tensor([0, 1]),
+        "species": torch.tensor([0, 1]),
+    }
+    out = model(x, targets)
+    assert out["order"].shape == (2, 1)
+    assert torch.all(out["order"] == 0)
+
+    # Inference: the single order is accepted with certainty (prob 1.0).
+    res = model.route(_img())
+    assert res.path[0].name == "Lepidoptera"
+    assert res.path[0].prob == pytest.approx(1.0)
+    assert res.path[0].accepted
+
+    # The absent router must not be exported.
+    assert all(name != "router" for name, _ in model.export_modules())

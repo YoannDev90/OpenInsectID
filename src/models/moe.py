@@ -122,7 +122,9 @@ class HierarchicalMoE(nn.Module):
         self.n_species = len(self.species_names)
 
         backbone_kw = dict(backbone_name=backbone_name, width_mult=width_mult)
-        self.router = Expert(self.n_orders, **backbone_kw)
+        # A single-order tree has nothing to route: deterministic pass-through,
+        # the same rule as single-child parents at lower levels.
+        self.router = Expert(self.n_orders, **backbone_kw) if self.n_orders >= 2 else None
 
         # Per-expert key = f"{global_index}_{sanitized_name}" (unique, ModuleDict-safe).
         self._keys = {"family": [], "genus": [], "species": []}
@@ -250,7 +252,10 @@ class HierarchicalMoE(nn.Module):
         indices; the ground-truth parent selects the expert for levels 2-4.
         Returns per-level logits (B, n_classes_global).
         """
-        out = {"order": self.router(x)}
+        out = {
+            # Single order: constant logit 0 -> probability 1.0 (pass-through).
+            "order": self.router(x) if self.router is not None else x.new_zeros((x.size(0), 1))
+        }
         out["family"] = self._dispatch(
             x, targets["order"], self.family_experts, "family", self.n_families
         )
@@ -282,13 +287,23 @@ class HierarchicalMoE(nn.Module):
         tau = self.tau_levels if tau_levels is None else tuple(tau_levels)
         k = self.top_k_orders if top_k_orders is None else top_k_orders
 
-        order_probs = torch.softmax(self.router(x), dim=-1)[0]
-        dec = topk_with_threshold(order_probs, tau_order, k)
-        ambiguous = (not dec.confident) and k > 1
-        n_candidates = k if ambiguous else 1
+        if self.router is not None:
+            order_probs = torch.softmax(self.router(x), dim=-1)[0]
+            dec = topk_with_threshold(order_probs, tau_order, k)
+            ambiguous = (not dec.confident) and k > 1
+            n_candidates = k if ambiguous else 1
+            candidates = list(
+                zip(dec.indices[:n_candidates], dec.probs[:n_candidates])
+            )
+        else:
+            # Single order: pass through with certainty (prob 1.0, entropy 0),
+            # mirroring the single-child pass-through of lower levels.
+            order_probs = torch.ones(1, device=x.device)
+            candidates = [(0, 1.0)]
+            ambiguous = False
 
         best: CascadeResult | None = None
-        for order_idx, order_p in zip(dec.indices[:n_candidates], dec.probs[:n_candidates]):
+        for order_idx, order_p in candidates:
             res = self._descend(x, int(order_idx), float(order_p), order_probs, tau)
             res.ambiguous_orders = ambiguous
             if best is None or res.joint_prob > best.joint_prob:
@@ -369,7 +384,8 @@ class HierarchicalMoE(nn.Module):
         dependent), so each router/expert ships as its own file — see the
         export module and the Android loading strategy.
         """
-        yield "router", self.router
+        if self.router is not None:
+            yield "router", self.router
         for level, experts in (
             ("family", self.family_experts),
             ("genus", self.genus_experts),

@@ -94,10 +94,11 @@ def export_moe(
                 "parent_key": key,
                 "num_classes": int(experts[key].num_classes),
             }
-    manifest["modules"]["router"] = {
-        "level": "order",
-        "num_classes": int(model.router.num_classes),
-    }
+    if model.router is not None:
+        manifest["modules"]["router"] = {
+            "level": "order",
+            "num_classes": int(model.router.num_classes),
+        }
 
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return paths
