@@ -488,7 +488,7 @@ def main():
             lambda: build_export_nb(),
             "Open Insect ID v2 - Export ONNX INT8 TFLite",
             False,
-            [],
+            ["yoanndev90/open-insect-id-checkpoints"],
         ),
     }
 

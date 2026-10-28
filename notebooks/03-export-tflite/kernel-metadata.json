@@ -8,7 +8,9 @@
   "enable_gpu": "false",
   "enable_internet": "true",
   "machine_shape": "",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "yoanndev90/open-insect-id-checkpoints"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []
