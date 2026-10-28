@@ -19,7 +19,7 @@ def export_module(
     module: nn.Module,
     out_path: str | Path,
     image_size: int = 224,
-    opset: int = 17,
+    opset: int = 18,
     batch_size: int = 1,
     dynamic_batch: bool = False,
 ) -> Path:
@@ -57,7 +57,7 @@ def export_moe(
     model,
     out_dir: str | Path,
     image_size: int = 224,
-    opset: int = 17,
+    opset: int = 18,
 ) -> dict[str, Path]:
     """Export the router and every expert of a ``HierarchicalMoE``.
 

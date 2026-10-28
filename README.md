@@ -112,11 +112,12 @@ Each folder under `notebooks/` is one pushable Kaggle kernel (notebook +
 | `03-export-tflite.ipynb` | load checkpoints → per-module ONNX → INT8 → `.tflite` bundle | CPU |
 
 Each notebook installs the package from GitHub in its setup cell
-(`GITHUB_REPO`). Artifacts flow through the public dataset
-[yoanndev90/open-insect-id-v2](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-v2):
-notebook `01` publishes the curated manifest/images there, `02` already
-attaches it as an input, and `03` attaches the checkpoint dataset published by
-`02` (created on the first training run).
+(`GITHUB_REPO`). Artifacts flow through two public Kaggle datasets:
+[yoanndev90/open-insect-id-v2](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-v2)
+(curated manifest + images, published by `01`) and
+[yoanndev90/open-insect-id-checkpoints](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-checkpoints)
+(trained `moe_state.pt` + `taxonomy.json`, published by `02` on its first
+run). Notebook `02` attaches the former as an input, `03` the latter.
 
 ### Use as a library
 
