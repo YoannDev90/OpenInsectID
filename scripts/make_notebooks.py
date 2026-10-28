@@ -345,17 +345,23 @@ print("saved:", sorted(p.name for p in out.iterdir()))
 
 # On Kaggle, push the run (final weights + resumable last.pt) to the
 # checkpoints dataset consumed by export notebook 03 and by this notebook's
-# resume logic on any other machine. Skipped when nothing was trained.
-import subprocess
-if IS_KAGGLE and history["train"]:
+# resume logic on any other machine. `kaggle datasets version` requires the
+# metadata file inside the folder, so write it right before pushing.
+import json, subprocess
+if IS_KAGGLE and (out / "last.pt").exists():
+    (out / "dataset-metadata.json").write_text(json.dumps({
+        "title": "Open Insect ID - Checkpoints",
+        "id": "yoanndev90/open-insect-id-checkpoints",
+        "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
+    }))
     r = subprocess.run(
         ["kaggle", "datasets", "version", "-p", "checkpoints",
-         "-m", f"02-train-moe: {len(history['train'])} epoch(s)", "-q"],
+         "-m", f"02-train-moe: {len(history['train'])} epoch(s) this run", "-q"],
         capture_output=True, text=True,
     )
-    print("dataset:", (r.stdout + r.stderr).strip() or "pushed")
+    print("push rc:", r.returncode, "|", (r.stdout + r.stderr).strip() or "ok")
 else:
-    print("local run or no training: dataset push skipped")
+    print("local run or no checkpoint: dataset push skipped")
 '''
         ),
     ]
