@@ -11,6 +11,20 @@ from pathlib import Path
 NB_DIR = Path(__file__).resolve().parents[1] / "notebooks"
 NB_DIR.mkdir(exist_ok=True)
 
+# --- Run controls (single source for the generated notebooks) --------------
+# Production values: resume enabled, full 5h budget. For the seamless-resume
+# verification protocol these are edited LOCALLY per run (the generator edit
+# itself is reverted before any commit — only production defaults land in
+# git; the generated notebooks pushed to Kaggle may differ in these knobs,
+# which don't affect the weights):
+#   alpha = RESUME=False, BUDGET_MIN=0.4  (stops mid-training, pushes ckpt)
+#   beta  = RESUME=True,  BUDGET_MIN=300  (resumes alpha, prints hash H_beta)
+#   gamma = RESUME=False, BUDGET_MIN=300  (fresh full run, prints hash H_gamma)
+# Seamless resume holds iff H_beta == H_gamma (same git commit for all three).
+RESUME = True
+BUDGET_MIN = 300
+SMALL_N = 10  # records downloaded by the data-pipeline smoke run
+
 
 def nb():
     return nbf.v4.new_notebook()
@@ -153,10 +167,10 @@ from src.data_pipeline import ImageDownloader
 downloader = ImageDownloader(dl_cfg)
 # Small test slice: only the first SMALL_N records are downloaded.
 # Raise it (or use records directly) for a real run.
-SMALL_N = 10
+SMALL_N = __SMALL_N__
 result = downloader.download_sync(records[:SMALL_N])
 print(f"from {SMALL_N} records -> ok={result.ok} failed={result.failed} skipped(dup)={result.skipped}")
-'''
+'''.replace("__SMALL_N__", str(SMALL_N))
         ),
         md("## 4. Curation (integrity / resolution / aspect ratio)"),
         code(
@@ -229,6 +243,9 @@ Set the accelerator to **GPU**. This notebook:
         md("## Config"),
         code(
             '''\
+import random
+
+import numpy as np
 import torch
 
 from src.models import HierarchicalMoE, TaxonomyTree
@@ -237,7 +254,20 @@ from src.training import (
     train_transform, eval_transform, build_dataloaders,
 )
 
+# One seed for every RNG before anything is built: with deterministic
+# algorithms on, this makes full runs reproducible — and, combined with the
+# RNG states captured in checkpoints, makes resumed runs seamless.
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Run controls (adjust per execution):
+RESUME = __RESUME__       # False ignores existing checkpoints (from-scratch runs)
+BUDGET_MIN = __BUDGET_MIN__    # wall-clock budget in minutes (0 = unlimited); on expiry
+                    # training stops cleanly with a checkpoint to resume from
 cfg = TrainConfig(
     epochs=30, lr=1e-3, weight_decay=1e-4,
     level_weights=(8.0, 4.0, 2.0, 1.0),   # order >> species
@@ -248,10 +278,10 @@ cfg = TrainConfig(
     # Chunked training: checkpoint every 5 epochs and stop cleanly once the
     # wall-clock budget is spent (guards the ~9h kernel limit and the GPU
     # quota). The next run resumes from checkpoints/last.pt automatically.
-    ckpt_dir="checkpoints", ckpt_every=5, max_minutes=300,
+    ckpt_dir="checkpoints", ckpt_every=5, max_minutes=BUDGET_MIN,
 )
 print("device:", device)
-'''
+'''.replace("__RESUME__", str(RESUME)).replace("__BUDGET_MIN__", str(BUDGET_MIN))
         ),
         md("## Load manifest + build tree"),
         code(
@@ -318,11 +348,15 @@ force a from-scratch run."""
 trainer = Trainer(model, cfg, teacher=teacher)
 
 from pathlib import Path
-resume = next(
-    (p for p in (Path("checkpoints/last.pt"),
-                 Path("/kaggle/input/open-insect-id-checkpoints/last.pt"))
-     if p.exists()),
-    None,
+resume = (
+    next(
+        (p for p in (Path("checkpoints/last.pt"),
+                     Path("/kaggle/input/open-insect-id-checkpoints/last.pt"))
+         if p.exists()),
+        None,
+    )
+    if RESUME
+    else None
 )
 if resume is not None:
     start = trainer.load_checkpoint(resume)
@@ -342,6 +376,17 @@ out = Path("checkpoints"); out.mkdir(exist_ok=True)
 torch.save(model.state_dict(), out / "moe_state.pt")
 tree.save(out / "taxonomy.json")
 print("saved:", sorted(p.name for p in out.iterdir()))
+
+# Content digest of the final weights: an interrupted + resumed run must
+# print the same sha256 as an uninterrupted one (compare across kernel logs
+# — no need to download any artifact).
+import hashlib
+sd = model.state_dict()
+h = hashlib.sha256()
+for k in sorted(sd):
+    v = sd[k].detach().cpu().contiguous()
+    h.update(k.encode()); h.update(str(v.dtype).encode()); h.update(v.numpy().tobytes())
+print("model sha256:", h.hexdigest())
 
 # On Kaggle, push the run (final weights + resumable last.pt) to the
 # checkpoints dataset consumed by export notebook 03 and by this notebook's

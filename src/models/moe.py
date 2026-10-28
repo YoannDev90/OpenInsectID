@@ -223,7 +223,9 @@ class HierarchicalMoE(nn.Module):
             else:
                 row_key.append(self._key_for_parent(level, parent))
 
-        for key in set(k for k in row_key if k is not None):
+        # sorted() (not raw set iteration): expert execution order must not
+        # depend on PYTHONHASHSEED, or runs would stop being bit-identical.
+        for key in sorted(set(k for k in row_key if k is not None)):
             rows = [i for i, k in enumerate(row_key) if k == key]
             idx = torch.as_tensor(rows, device=x.device)
             logits = experts[key](x[idx])  # (n, n_local)

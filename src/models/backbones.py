@@ -151,14 +151,17 @@ class MobileNetV4(nn.Module):
                 inp = out
         self.blocks = nn.Sequential(*blocks)
         self.head_conv = ConvBNAct(inp, head, 1, 1)
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.out_channels = head
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         x = self.blocks(x)
         x = self.head_conv(x)
-        return self.pool(x).flatten(1)
+        # Global average pooling as a plain mean: mathematically identical to
+        # AdaptiveAvgPool2d(1), but AdaptiveAvgPool2d's backward pass is one
+        # of the CUDA ops PyTorch flags as nondeterministic — it raises under
+        # torch.use_deterministic_algorithms(True), which the trainer enables.
+        return x.mean((-2, -1))
 
 
 class TimmBackbone(nn.Module):

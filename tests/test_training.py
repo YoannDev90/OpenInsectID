@@ -166,3 +166,47 @@ def test_time_budget_stops_with_checkpoint(tmp_path):
     assert (tmp_path / "last.pt").exists()  # ...but checkpointed first
     t2 = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
     assert t2.load_checkpoint(tmp_path / "last.pt") == 1  # resumes at epoch 2
+
+
+def test_checkpoint_restores_all_rng_streams(tmp_path):
+    """Seamless resume: the checkpoint must capture/restore every RNG stream
+    (torch, python random, numpy) so the continuation is bit-identical."""
+    import random
+
+    import numpy as np
+    import torch
+
+    from src.models import HierarchicalMoE
+    from src.training import Trainer, TrainConfig, build_dataloaders, train_transform
+
+    mpath, root = _write_tiny_manifest(tmp_path, n=8)
+    train_loader, _, tree = build_dataloaders(
+        mpath, root, batch_size=8, val_fraction=0.25,
+        num_workers=0, transform=train_transform(image_size=224), seed=0,
+    )
+    cfg = TrainConfig(epochs=1, device="cpu", mixup_alpha=0.0, log_every=1)
+    trainer = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+    # Deterministic algorithms are on by default (bit-exact run-to-run).
+    assert torch.are_deterministic_algorithms_enabled()
+
+    # Advance every stream so the captured state is non-trivial, then save.
+    torch.manual_seed(7)
+    random.seed(7)
+    np.random.seed(7)
+    torch.rand(4)
+    random.random()
+    np.random.rand(3)
+    ckpt = trainer.save_checkpoint(tmp_path / "last.pt", 42)
+
+    expected = (torch.rand(6), random.random(), np.random.rand(4))
+
+    # Scramble everything, then restore: the next draws must match exactly.
+    torch.manual_seed(999)
+    random.seed(999)
+    np.random.seed(999)
+    assert trainer.load_checkpoint(ckpt) == 42
+
+    got = (torch.rand(6), random.random(), np.random.rand(4))
+    assert torch.equal(expected[0], got[0])
+    assert expected[1] == got[1]
+    assert np.array_equal(expected[2], got[2])

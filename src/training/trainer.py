@@ -7,15 +7,22 @@ construct the model + loss, and call ``Trainer.fit``. Supports:
 - optional Mixup/CutMix,
 - optional BioCLIP knowledge distillation (teacher must be supplied),
 - gradient clipping, cosine LR, AMP on GPU,
-- accuracy at each level and end-to-end path accuracy.
+- accuracy at each level and end-to-end path accuracy,
+- bit-exact resumable training: checkpoints carry every RNG stream (torch,
+  CUDA, Python, numpy) and the trainer defaults to deterministic algorithms,
+  so an interrupted + resumed run is indistinguishable from an uninterrupted
+  one.
 """
 
 from __future__ import annotations
 
+import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -23,6 +30,18 @@ from torch.utils.data import DataLoader
 from ..models.moe import HierarchicalMoE
 from .augment import mixup_cutmix_batch
 from .losses import CombinedTaxonomicLoss
+
+
+def _numpy_rng_state() -> list:
+    """numpy RNG state as plain weights_only-safe types."""
+    st = np.random.get_state()
+    return [str(st[0]), st[1].tolist(), int(st[2]), int(st[3]), float(st[4])]
+
+
+def _set_numpy_rng_state(st: list) -> None:
+    np.random.set_state(
+        (st[0], np.asarray(st[1], dtype=np.uint32), int(st[2]), int(st[3]), float(st[4]))
+    )
 
 
 @dataclass
@@ -40,6 +59,10 @@ class TrainConfig:
     use_amp: bool = True
     log_every: int = 50
     device: str = "cuda"
+    # Bit-exact reproducibility (and therefore bit-exact resumes): fixed
+    # cudnn algorithms + strict deterministic ops. Off = faster but
+    # run-to-run differences possible on CUDA.
+    deterministic: bool = True
     # Chunked / resumable training (0 or "" disables each mechanism):
     ckpt_dir: str = ""        # where last.pt is written periodically
     ckpt_every: int = 5       # save every N completed epochs
@@ -69,6 +92,13 @@ class Trainer:
         self.device = torch.device(
             config.device if torch.cuda.is_available() or config.device == "cpu" else "cpu"
         )
+        # Determinism must be configured before the first CUDA matmul so the
+        # cuBLAS workspace and cudnn algorithm choices are pinned: identical
+        # runs (and resumed runs) then produce bit-identical weights.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(config.deterministic)
+        torch.backends.cudnn.deterministic = config.deterministic
+        torch.backends.cudnn.benchmark = False
         self.model.to(self.device)
         self.teacher = teacher
         if teacher is not None:
@@ -102,15 +132,29 @@ class Trainer:
         self.start_epoch = 0
 
     def save_checkpoint(self, path: str | Path, epoch: int) -> Path:
-        """Persist everything needed to resume after epoch ``epoch`` (exclusive)."""
+        """Persist everything needed to resume after ``epoch`` (exclusive).
+
+        Besides model/optimizer/scaler state, every RNG stream active during
+        training (torch CPU, CUDA, Python ``random``, numpy) is captured —
+        restoring them on resume makes the continuation bit-identical to an
+        uninterrupted run.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        rng = {
+            "torch": torch.get_rng_state(),
+            "python": random.getstate(),
+            "numpy": _numpy_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
         torch.save(
             {
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "scaler": self.scaler.state_dict(),
                 "epoch": int(epoch),
+                "rng": rng,
             },
             path,
         )
@@ -119,7 +163,9 @@ class Trainer:
     def load_checkpoint(self, path: str | Path) -> int:
         """Restore a checkpoint saved by :meth:`save_checkpoint`.
 
-        Returns the epoch index ``fit()`` will resume from.
+        Returns the epoch index ``fit()`` will resume from. RNG streams are
+        restored last so training continues exactly where it left off;
+        checkpoints without RNG state (older format) still load.
         """
         ckpt = torch.load(path, map_location="cpu")
         self.model.load_state_dict(ckpt["model"])
@@ -131,6 +177,18 @@ class Trainer:
             for k, v in state.items():
                 if torch.is_tensor(v):
                     state[k] = v.to(self.device)
+        rng = ckpt.get("rng")
+        if rng:
+            torch.set_rng_state(rng["torch"])
+            random.setstate(rng["python"])
+            _set_numpy_rng_state(rng["numpy"])
+            cuda_states = rng.get("cuda")
+            if (
+                cuda_states
+                and torch.cuda.is_available()
+                and len(cuda_states) == torch.cuda.device_count()
+            ):
+                torch.cuda.set_rng_state_all(cuda_states)
         self.start_epoch = int(ckpt["epoch"])
         return self.start_epoch
 
