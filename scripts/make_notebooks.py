@@ -339,6 +339,28 @@ Android app. Attach the checkpoint output-dataset from notebook 02.
 """
         ),
         code(INSTALL),
+        code(
+            '''\
+# Export stack (aligned with the `export` extra in pyproject.toml): onnx +
+# onnxruntime for INT8 PTQ, onnxscript for the dynamo exporter that recent
+# torch builds use by default, onnx2tf + tflite-support for TFLite.
+import importlib.util, subprocess, sys
+
+missing = [m for m in ("onnx", "onnxruntime", "onnxscript", "onnx2tf",
+                       "tflite_support")
+           if importlib.util.find_spec(m) is None]
+if missing:
+    print("installing:", missing)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q",
+         "onnxscript", "onnxruntime>=1.18", "onnx2tf", "onnx==1.17.0",
+         "tflite-support"],
+        check=True,
+    )
+else:
+    print("export stack already present")
+'''
+        ),
         md("## Load the trained model"),
         code(
             '''\
@@ -379,12 +401,13 @@ import torch
 calib = torch.randn(64, 3, 224, 224)
 
 qdir = Path("export/onnx_int8"); qdir.mkdir(parents=True, exist_ok=True)
-router_onnx = onnx_dir / "router.onnx"
-if router_onnx.exists():
-    q = quantize_static_int8(router_onnx, qdir / "router_int8.onnx", calib)
-    print("quantized router ->", q)
-else:
-    print("router.onnx not found; run the export cell first.")
+# A single-order smoke tree exports no router: quantize the first exported
+# module instead so the INT8 + TFLite steps still exercise the full chain.
+module_name = "router" if "router" in paths else sorted(paths)[0]
+module_onnx = onnx_dir / f"{module_name}.onnx"
+print("quantizing:", module_name)
+q = quantize_static_int8(module_onnx, qdir / f"{module_name}_int8.onnx", calib)
+print("quantized ->", q)
 '''
         ),
         md(
@@ -402,8 +425,9 @@ from src.export import TFLiteINT8Converter
 
 conv = TFLiteINT8Converter()
 tflite_dir = Path("export/tflite"); tflite_dir.mkdir(parents=True, exist_ok=True)
-if conv.available() and router_onnx.exists():
-    tfl = conv.convert(router_onnx, tflite_dir, int8=True)
+if conv.available():
+    # Convert the INT8 (QDQ) ONNX: onnx2tf maps it to a full-INT8 .tflite.
+    tfl = conv.convert(qdir / f"{module_name}_int8.onnx", tflite_dir, int8=True)
     print("tflite ->", tfl)
 else:
     print("onnx2tf not installed. Install with:")
