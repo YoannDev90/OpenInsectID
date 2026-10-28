@@ -341,21 +341,18 @@ Android app. Attach the checkpoint output-dataset from notebook 02.
         code(INSTALL),
         code(
             '''\
-# Export stack (aligned with the `export` extra in pyproject.toml): onnx +
-# onnxruntime for INT8 PTQ, onnxscript for the dynamo exporter that recent
-# torch builds use by default, onnx2tf + tflite-support for TFLite.
+# Export stack. onnx2tf (>=2.x) pins its own fully-py3.13-compatible stack
+# (onnx, onnxruntime, onnxscript, ai-edge-litert), so a single install covers
+# INT8 PTQ and the ONNX -> TFLite conversion; onnxscript also serves the
+# dynamo exporter recent torch builds use by default.
 import importlib.util, subprocess, sys
 
-missing = [m for m in ("onnx", "onnxruntime", "onnxscript", "onnx2tf",
-                       "tflite_support")
+missing = [m for m in ("onnx", "onnxruntime", "onnxscript", "onnx2tf")
            if importlib.util.find_spec(m) is None]
 if missing:
     print("installing:", missing)
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q",
-         "onnxscript", "onnxruntime>=1.18", "onnx2tf", "onnx==1.17.0",
-         "tflite-support"],
-        check=True,
+        [sys.executable, "-m", "pip", "install", "-q", "onnx2tf"], check=True
     )
 else:
     print("export stack already present")
@@ -413,10 +410,10 @@ print("quantized ->", q)
         md(
             """## Convert to TFLite
 
-Uses `onnx2tf` when available. Install it with
-`pip install onnx2tf onnx==1.17.0 tflite-support` on the Kaggle kernel
-(via `!pip install ...`). If it is absent the converter prints the exact
-command to run instead of failing.
+Uses the `onnx2tf` CLI (installed by the setup cell above: since v2.x it
+pins its own py3.13-compatible stack — no tensorflow or tflite-support
+needed). If it is absent the converter prints the exact install command
+instead of failing.
 """
         ),
         code(
@@ -431,7 +428,7 @@ if conv.available():
     print("tflite ->", tfl)
 else:
     print("onnx2tf not installed. Install with:")
-    print("  !pip install onnx2tf onnx==1.17.0 tflite-support")
+    print("  !pip install onnx2tf")
     print("then re-run this cell.")
 '''
         ),

@@ -134,8 +134,9 @@ class TFLiteINT8Converter:
         if not self.available():
             raise RuntimeError(
                 "onnx2tf not found. Install with:\n"
-                "  pip install onnx2tf onnx==1.17.0 tflite-support\n"
-                "or run the equivalent CLI:\n"
+                "  pip install onnx2tf\n"
+                "(it pins its own onnx/onnxruntime/onnxscript stack; no more\n"
+                " tflite-support or tensorflow needed) or run the CLI:\n"
                 f"  onnx2tf -i {onnx_path} -o {out_dir}"
                 + (" -nuo" if int8 else "")
             )
