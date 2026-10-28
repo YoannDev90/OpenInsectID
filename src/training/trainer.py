@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,10 @@ class TrainConfig:
     use_amp: bool = True
     log_every: int = 50
     device: str = "cuda"
+    # Chunked / resumable training (0 or "" disables each mechanism):
+    ckpt_dir: str = ""        # where last.pt is written periodically
+    ckpt_every: int = 5       # save every N completed epochs
+    max_minutes: float = 0.0  # wall-clock budget per run (stop cleanly at 0)
 
 
 @dataclass
@@ -93,6 +98,41 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(
             enabled=config.use_amp and self.device.type == "cuda"
         )
+        # Epoch index fit() starts from; raised by load_checkpoint().
+        self.start_epoch = 0
+
+    def save_checkpoint(self, path: str | Path, epoch: int) -> Path:
+        """Persist everything needed to resume after epoch ``epoch`` (exclusive)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict(),
+                "epoch": int(epoch),
+            },
+            path,
+        )
+        return path
+
+    def load_checkpoint(self, path: str | Path) -> int:
+        """Restore a checkpoint saved by :meth:`save_checkpoint`.
+
+        Returns the epoch index ``fit()`` will resume from.
+        """
+        ckpt = torch.load(path, map_location="cpu")
+        self.model.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if ckpt.get("scaler"):
+            self.scaler.load_state_dict(ckpt["scaler"])
+        # Optimizer state tensors come back on CPU: move them to the device.
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(self.device)
+        self.start_epoch = int(ckpt["epoch"])
+        return self.start_epoch
 
     def _targets(self, batch: dict) -> dict[str, torch.Tensor]:
         return {
@@ -138,7 +178,8 @@ class Trainer:
     ) -> dict[str, list]:
         history: dict[str, list] = {"train": [], "val": []}
         callbacks = callbacks or []
-        for epoch in range(self.cfg.epochs):
+        t0 = time.time()
+        for epoch in range(self.start_epoch, self.cfg.epochs):
             self._set_lr(epoch)
             tr = self._run_epoch(train_loader, train=True)
             history["train"].append(tr)
@@ -156,6 +197,31 @@ class Trainer:
             print(msg)
             for cb in callbacks:
                 cb(epoch, self.model, history)
+
+            # Resumable / chunked runs: persist periodically, and stop cleanly
+            # (with a checkpoint) when the wall-clock budget is exhausted.
+            done = epoch + 1
+            over = (
+                self.cfg.max_minutes > 0
+                and (time.time() - t0) / 60.0 >= self.cfg.max_minutes
+            )
+            periodic = (
+                bool(self.cfg.ckpt_dir)
+                and self.cfg.ckpt_every > 0
+                and done % self.cfg.ckpt_every == 0
+            )
+            if self.cfg.ckpt_dir and (periodic or over):
+                ckpt = self.save_checkpoint(
+                    Path(self.cfg.ckpt_dir) / "last.pt", done
+                )
+                print(f"checkpoint: {ckpt} (epoch {done}/{self.cfg.epochs})")
+            if over:
+                print(
+                    f"time budget {self.cfg.max_minutes:.0f} min reached: "
+                    f"stopping after epoch {done}/{self.cfg.epochs} — "
+                    "re-run to resume"
+                )
+                break
         return history
 
     def _run_epoch(self, loader: DataLoader, train: bool) -> EpochStats:

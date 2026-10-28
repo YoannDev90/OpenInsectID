@@ -119,6 +119,11 @@ Each notebook installs the package from GitHub in its setup cell
 (trained `moe_state.pt` + `taxonomy.json`, published by `02` on its first
 run). Notebook `02` attaches the former as an input, `03` the latter.
 
+Training is **resumable**: `02` checkpoints model + optimizer every 5 epochs
+(`checkpoints/last.pt`, also pushed to the checkpoints dataset) and stops
+cleanly once its wall-clock budget is spent, so a run cut short by the kernel
+limit or by GPU quota continues on the next execution instead of restarting.
+
 ### Use as a library
 
 ```python

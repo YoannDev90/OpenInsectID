@@ -245,6 +245,10 @@ cfg = TrainConfig(
     lambda_cost=1.0,                      # taxonomic cost-matrix strength
     mixup_alpha=0.4,
     device=device,
+    # Chunked training: checkpoint every 5 epochs and stop cleanly once the
+    # wall-clock budget is spent (guards the ~9h kernel limit and the GPU
+    # quota). The next run resumes from checkpoints/last.pt automatically.
+    ckpt_dir="checkpoints", ckpt_every=5, max_minutes=300,
 )
 print("device:", device)
 '''
@@ -301,11 +305,33 @@ else:
 print("distillation:", "enabled" if teacher else "disabled")
 '''
         ),
-        md("## Train"),
+        md(
+            """## Train
+
+Resumable: a previous interrupted run continues where it stopped. The state
+is looked up in this kernel's working directory first, then in the mounted
+checkpoints dataset. Delete `checkpoints/last.pt` (or detach the dataset) to
+force a from-scratch run."""
+        ),
         code(
             '''\
 trainer = Trainer(model, cfg, teacher=teacher)
+
+from pathlib import Path
+resume = next(
+    (p for p in (Path("checkpoints/last.pt"),
+                 Path("/kaggle/input/open-insect-id-checkpoints/last.pt"))
+     if p.exists()),
+    None,
+)
+if resume is not None:
+    start = trainer.load_checkpoint(resume)
+    print(f"resumed from {resume} -> will run epochs {start+1}..{cfg.epochs}")
+else:
+    print("no checkpoint found: training from scratch")
+
 history = trainer.fit(train_loader, val_loader)
+print("epochs trained this run:", len(history["train"]))
 '''
         ),
         md("## Save checkpoints"),
@@ -315,12 +341,21 @@ from pathlib import Path
 out = Path("checkpoints"); out.mkdir(exist_ok=True)
 torch.save(model.state_dict(), out / "moe_state.pt")
 tree.save(out / "taxonomy.json")
-print("saved:", list(p.name for p in out.iterdir()))
+print("saved:", sorted(p.name for p in out.iterdir()))
 
-# On Kaggle, publish the checkpoint directory as an output dataset so the
-# export notebook (03) can attach it:
-#   !kaggle datasets create -p checkpoints --dir-mode tar -u
-# (slug: yoanndev90/open-insect-id-checkpoints)
+# On Kaggle, push the run (final weights + resumable last.pt) to the
+# checkpoints dataset consumed by export notebook 03 and by this notebook's
+# resume logic on any other machine. Skipped when nothing was trained.
+import subprocess
+if IS_KAGGLE and history["train"]:
+    r = subprocess.run(
+        ["kaggle", "datasets", "version", "-p", "checkpoints",
+         "-m", f"02-train-moe: {len(history['train'])} epoch(s)", "-q"],
+        capture_output=True, text=True,
+    )
+    print("dataset:", (r.stdout + r.stderr).strip() or "pushed")
+else:
+    print("local run or no training: dataset push skipped")
 '''
         ),
     ]
@@ -503,7 +538,12 @@ def main():
             lambda: build_train_nb(),
             "Open Insect ID v2 - Train Vision MoE",
             True,
-            ["yoanndev90/open-insect-id-v2"],
+            # The checkpoints dataset doubles as resume source (mounted
+            # last.pt) and as the output consumed by notebook 03.
+            [
+                "yoanndev90/open-insect-id-v2",
+                "yoanndev90/open-insect-id-checkpoints",
+            ],
         ),
         "03-export-tflite": (
             lambda: build_export_nb(),

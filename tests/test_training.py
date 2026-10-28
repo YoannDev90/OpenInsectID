@@ -109,3 +109,60 @@ def test_step_loss_mixup_path_costs_and_backprops(tmp_path):
     assert torch.isfinite(loss)
     assert loss.requires_grad
     loss.backward()
+
+
+def test_checkpoint_roundtrip_and_resume(tmp_path):
+    """save_checkpoint -> load_checkpoint restores model + optimizer and
+    tells fit() where to continue (chunked Kaggle runs)."""
+    import torch
+
+    from src.models import HierarchicalMoE
+    from src.training import Trainer, TrainConfig, build_dataloaders, train_transform
+
+    mpath, root = _write_tiny_manifest(tmp_path, n=8)
+    train_loader, val_loader, tree = build_dataloaders(
+        mpath, root, batch_size=8, val_fraction=0.25,
+        num_workers=0, transform=train_transform(image_size=224), seed=0,
+    )
+    ckpt_dir = tmp_path / "ckpt"
+    cfg = TrainConfig(
+        epochs=2, device="cpu", use_amp=False, mixup_alpha=0.0, log_every=1,
+        ckpt_dir=str(ckpt_dir), ckpt_every=1,
+    )
+    t1 = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+    t1.fit(train_loader, val_loader)
+    ckpt = ckpt_dir / "last.pt"
+    assert ckpt.exists()
+
+    # A fresh trainer (fresh model + optimizer) resumes with identical state.
+    t2 = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+    assert t2.load_checkpoint(ckpt) == 2  # both epochs completed
+    assert t2.fit(train_loader, val_loader)["train"] == []  # nothing left
+    sd1, sd2 = t1.model.state_dict(), t2.model.state_dict()
+    assert all(torch.equal(sd1[k], sd2[k]) for k in sd1)
+    # Optimizer state survived the roundtrip (needed for real continuations).
+    assert t2.optimizer.state
+
+
+def test_time_budget_stops_with_checkpoint(tmp_path):
+    """max_minutes stops fit() after a completed epoch — with a checkpoint
+    on disk so the next run can resume (quota / kernel-limit guard)."""
+    from src.models import HierarchicalMoE
+    from src.training import Trainer, TrainConfig, build_dataloaders, train_transform
+
+    mpath, root = _write_tiny_manifest(tmp_path, n=8)
+    train_loader, val_loader, tree = build_dataloaders(
+        mpath, root, batch_size=8, val_fraction=0.25,
+        num_workers=0, transform=train_transform(image_size=224), seed=0,
+    )
+    cfg = TrainConfig(
+        epochs=50, device="cpu", use_amp=False, mixup_alpha=0.0, log_every=1,
+        ckpt_dir=str(tmp_path), ckpt_every=1000, max_minutes=1e-9,
+    )
+    trainer = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+    history = trainer.fit(train_loader, val_loader)
+
+    assert len(history["train"]) == 1       # stopped after the first epoch
+    assert (tmp_path / "last.pt").exists()  # ...but checkpointed first
+    t2 = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+    assert t2.load_checkpoint(tmp_path / "last.pt") == 1  # resumes at epoch 2

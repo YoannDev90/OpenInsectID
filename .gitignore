@@ -27,3 +27,6 @@ checkpoints/
 
 # Local engineering plan (not published)
 PLAN.md
+
+# Export artifacts (local runs of notebook 03)
+export/
