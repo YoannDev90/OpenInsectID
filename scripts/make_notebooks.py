@@ -346,13 +346,20 @@ print("saved:", sorted(p.name for p in out.iterdir()))
 # On Kaggle, push the run (final weights + resumable last.pt) to the
 # checkpoints dataset consumed by export notebook 03 and by this notebook's
 # resume logic on any other machine. `kaggle datasets version` requires the
-# metadata file inside the folder, so write it right before pushing.
-import json, subprocess
+# metadata file inside the folder, so write it right before pushing. The
+# preinstalled CLI (2.0.2) mangles the dataset's license and keywords on
+# version pushes — upgrade it first.
+import json, subprocess, sys
 if IS_KAGGLE and (out / "last.pt").exists():
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
+        check=False,
+    )
     (out / "dataset-metadata.json").write_text(json.dumps({
         "title": "Open Insect ID - Checkpoints",
         "id": "yoanndev90/open-insect-id-checkpoints",
         "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
+        "keywords": ["classification", "research", "python", "beginner"],
     }))
     r = subprocess.run(
         ["kaggle", "datasets", "version", "-p", "checkpoints",
@@ -361,7 +368,7 @@ if IS_KAGGLE and (out / "last.pt").exists():
     )
     print("push rc:", r.returncode, "|", (r.stdout + r.stderr).strip() or "ok")
 else:
-    print("local run or no checkpoint: dataset push skipped")
+    print("no local last.pt to push (local run, or resume came from the mounted dataset)")
 '''
         ),
     ]
