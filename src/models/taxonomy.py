@@ -148,10 +148,19 @@ class TaxonomyTree:
 
     @classmethod
     def from_manifest(cls, df) -> "TaxonomyTree":
-        """Build from a Polars DataFrame with order/family/genus/species columns."""
+        """Build from a Polars DataFrame with order/family/genus/species columns.
+
+        The unique rows are explicitly sorted: polars' ``unique()`` makes no
+        ordering guarantee (its multithreaded engine returns rows in an
+        arbitrary order that can differ between calls/processes), and the
+        species label indices follow insertion order here — an unstable row
+        order would give different label spaces (hence different models) on
+        otherwise identical runs.
+        """
         rows = (
             df.select(["order", "family", "genus", "species"])
             .unique()
+            .sort(["order", "family", "genus", "species"])
             .iter_rows()
         )
         return cls(tuple(r) for r in rows)

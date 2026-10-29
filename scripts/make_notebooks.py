@@ -286,14 +286,22 @@ print("device:", device)
         md("## Load manifest + build tree"),
         code(
             '''\
-# On Kaggle, point these at your attached input dataset.
-MANIFEST = "/kaggle/input/open-insect-id-v2/insectid_manifest.parquet"
-IMAGE_ROOT = "/kaggle/input/open-insect-id-v2/images"
-
+# On Kaggle, point these at your attached input dataset. Kaggle mounts inputs
+# at /kaggle/input/<slug> on the classic runtime and at
+# /kaggle/input/datasets/<owner>/<slug> on the newer BYOD runtime: probe both.
 from pathlib import Path
-if not Path(MANIFEST).exists():
-    MANIFEST = "insectid_manifest.parquet"
-    IMAGE_ROOT = "data/raw"
+
+MOUNTS = [Path("/kaggle/input"), Path("/kaggle/input/datasets/yoanndev90")]
+def _input(*rel):
+    for base in MOUNTS:
+        p = base.joinpath("open-insect-id-v2", *rel)
+        if p.exists():
+            return p
+    return None
+
+MANIFEST, IMAGE_ROOT = _input("insectid_manifest.parquet"), _input("images")
+if MANIFEST is None:  # local run
+    MANIFEST, IMAGE_ROOT = Path("insectid_manifest.parquet"), Path("data/raw")
 
 train_loader, val_loader, tree = build_dataloaders(
     MANIFEST, IMAGE_ROOT, batch_size=128,
@@ -348,13 +356,13 @@ force a from-scratch run."""
 trainer = Trainer(model, cfg, teacher=teacher)
 
 from pathlib import Path
+# Resume source: this kernel's working dir first, then the mounted
+# checkpoints dataset (both mount layouts probed, like the manifest above).
+candidates = [Path("checkpoints/last.pt")] + [
+    base / "open-insect-id-checkpoints" / "last.pt" for base in MOUNTS
+]
 resume = (
-    next(
-        (p for p in (Path("checkpoints/last.pt"),
-                     Path("/kaggle/input/open-insect-id-checkpoints/last.pt"))
-         if p.exists()),
-        None,
-    )
+    next((p for p in candidates if p.exists()), None)
     if RESUME
     else None
 )
@@ -455,12 +463,18 @@ else:
         code(
             '''\
 import torch
+from pathlib import Path
 from src.models import HierarchicalMoE, TaxonomyTree
 
-CKPT = "/kaggle/input/open-insect-id-checkpoints/moe_state.pt"
-TAX  = "/kaggle/input/open-insect-id-checkpoints/taxonomy.json"
-if not Path(CKPT).exists():
-    CKPT, TAX = "checkpoints/moe_state.pt", "checkpoints/taxonomy.json"
+# Probe both Kaggle mount layouts, then fall back to a local run.
+MOUNTS = [Path("/kaggle/input"), Path("/kaggle/input/datasets/yoanndev90")]
+_ckpt_dir = next(
+    (base / "open-insect-id-checkpoints"
+     for base in MOUNTS if (base / "open-insect-id-checkpoints" / "moe_state.pt").exists()),
+    Path("checkpoints"),
+)
+CKPT = str(_ckpt_dir / "moe_state.pt")
+TAX = str(_ckpt_dir / "taxonomy.json")
 
 tree = TaxonomyTree.load(TAX)
 model = HierarchicalMoE(tree, backbone_name="mnv4_small")

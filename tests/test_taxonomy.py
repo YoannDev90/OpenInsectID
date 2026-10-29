@@ -75,6 +75,40 @@ def test_from_manifest():
     assert tree.num_species == 3
 
 
+def test_from_manifest_is_row_order_independent():
+    """Label spaces must not depend on the manifest's row order.
+
+    polars' ``unique()`` returns rows in an arbitrary (engine-dependent)
+    order; if the tree followed it, two otherwise identical runs could build
+    different species index assignments — and produce different models from
+    the same data and seed. Whatever the input order, the derived tree (and
+    hence the label space) must be identical.
+    """
+    import numpy as np
+    import polars as pl
+
+    rows = []
+    for family in ("FamA", "FamB"):
+        for genus in ("GenusA", "GenusB"):
+            for sp in ("SpA", "SpB"):
+                rows.append(("Lepidoptera", family, genus, f"{sp} {genus} {family}"))
+    reference = TaxonomyTree.from_manifest(
+        pl.DataFrame(
+            {"order": [r[0] for r in rows], "family": [r[1] for r in rows],
+             "genus": [r[2] for r in rows], "species": [r[3] for r in rows]}
+        )
+    ).to_dict()
+    rng = np.random.RandomState(0)
+    for _ in range(10):
+        perm = rng.permutation(len(rows))
+        shuffled = [rows[i] for i in perm]
+        df = pl.DataFrame(
+            {"order": [r[0] for r in shuffled], "family": [r[1] for r in shuffled],
+             "genus": [r[2] for r in shuffled], "species": [r[3] for r in shuffled]}
+        )
+        assert TaxonomyTree.from_manifest(df).to_dict() == reference
+
+
 def test_path_divergence():
     a = ("Coleoptera", "Carabidae", "Carabus", "Carabus auratus")
     b = ("Coleoptera", "Carabidae", "Carabus", "Carabus insulicola")
