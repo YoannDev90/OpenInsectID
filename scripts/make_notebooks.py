@@ -633,6 +633,10 @@ def main():
         folder = NB_DIR / slug
         folder.mkdir(parents=True, exist_ok=True)
         b = builder()
+        # Deterministic cell ids: nbformat would mint fresh random ids on
+        # every regeneration, dirtying all notebooks in git for no reason.
+        for i, cell in enumerate(b.cells):
+            cell["id"] = f"c{i:02d}"
         b.metadata["kernelspec"] = {
             "display_name": "Python 3",
             "language": "python",
