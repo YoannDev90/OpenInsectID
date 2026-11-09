@@ -369,7 +369,10 @@ resume = (
 )
 if resume is not None:
     start = trainer.load_checkpoint(resume)
-    print(f"resumed from {resume} -> will run epochs {start+1}..{cfg.epochs}")
+    if start > 0:
+        print(f"resumed from {resume} -> will run epochs {start+1}..{cfg.epochs}")
+    else:
+        print(f"no usable checkpoint at {resume}: training epochs 1..{cfg.epochs}")
 else:
     print("no checkpoint found: training from scratch")
 
