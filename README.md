@@ -1,60 +1,58 @@
 # Open Insect ID v2
 
-On-device insect identification built on a **hierarchical Vision Mixture-of-Experts
-(MoE)** — a 4-level taxonomic cascade (Order → Family → Genus → Species) trained on
-global GBIF data and exported to **TFLite** for Android/Kotlin inference.
+On-device insect identification built on a **hierarchical vision cascade** —
+a shared MobileNetV4 trunk feeding 4 taxonomic heads (Order → Family → Genus →
+Species), trained on global GBIF data and exported to **TFLite** for
+Android/Kotlin inference.
 
 This repository contains the **model + data + training + export** Python package and
 its **Kaggle notebooks**. The Android app lives in a separate repository.
 
-## Why a hierarchical MoE instead of flat classification?
+## Why a hierarchical cascade instead of flat classification?
 
 A single softmax over tens of thousands of insect species is dominated by the
-long tail and forces every image through one giant classifier. Instead we route
-each image down a cascade of small specialists:
+long tail and forces every image through one giant classifier. Instead we run
+one small backbone and descend a cascade of per-parent heads, each only
+discriminating between **siblings**:
 
 ```mermaid
 flowchart TD
     IMG([Image])
 
-    subgraph L1["Level 1 — Order router"]
-        R[L1 router<br/>order classifier]
+    subgraph TRUNK["Shared trunk — one MobileNetV4 pass"]
+        T[Trunk<br/>features z]
     end
 
-    subgraph L2["Level 2 — Family experts"]
-        FA[Family expert A]
-        FB[Family expert B]
+    subgraph HEADS["4 level heads (linear)"]
+        R[Order head]
+        FA[Family head<br/>sliced to the predicted order]
+        G[Genus head<br/>sliced to the predicted family]
+        S[Species head<br/>sliced to the predicted genus]
     end
 
-    subgraph L3["Level 3 — Genus expert"]
-        G[Genus expert<br/>τ_level check]
-    end
-
-    subgraph L4["Level 4 — Species micro-expert"]
-        S[Species expert<br/>τ_level check]
-    end
-
-    AMB[Two candidate paths<br/>weighted by L1 probability]
+    AMB[Two candidate paths<br/>weighted by order probability]
     UNC[Order-level<br/>uncertainty]
     ANSWER([Deepest accepted level = the answer])
 
-    IMG --> R
+    IMG --> T
+    T --> R
     R -->|confidence &ge; τ₁ — Top-1| FA
     R -.->|confidence &lt; τ₁ — keep Top-2 orders| AMB
     R -.->|entropy &gt; τ_level| UNC
     AMB -.-> FA
-    AMB -.-> FB
     FA --> G
-    FB --> G
     G --> S
     S --> ANSWER
 ```
 
-Each expert only discriminates between **siblings**, so sub-problems stay small
-and edge-friendly. A confidence/entropy check at every level lets the pipeline
-stop early and return the deepest *certain* taxon instead of guessing — the
-`-.-` edges above are the fallback paths (Top-2 order routing and early
-rejection) that make the cascade robust to a wrong first guess.
+Each head only discriminates between the children of one parent node, so
+sub-problems stay small and edge-friendly, while the shared trunk keeps the
+model to ~4M backbone parameters regardless of species count (at 40k species
+the whole cascade is ~60M parameters, versus ~185B for a backbone per parent).
+A confidence/entropy check at every level lets the pipeline stop early and
+return the deepest *certain* taxon instead of guessing — the `-.-` edges above
+are the fallback paths (Top-2 order routing and early rejection) that make the
+cascade robust to a wrong first guess.
 
 ## Repository layout
 
@@ -63,11 +61,11 @@ configs/               # data + model YAML (GBIF filters, H3, backbones, τ thre
 src/
   data_pipeline/       # GBIF ingestion, DuckDB/H3 spatial cleaning, async image
                        #   download, automated curation
-  models/              # MobileNetV4 UIB backbones, taxonomy tree, per-node experts,
+  models/              # MobileNetV4 UIB backbones, taxonomy tree, cascade heads,
                        #   Top-K router, the 4-level HierarchicalMoE cascade
   training/            # hierarchical CE + focal + taxonomic cost-matrix loss,
                        #   BioCLIP distillation, dataset, Mixup/CutMix, Trainer
-  export/              # per-module ONNX, INT8 PTQ, TFLite conversion
+  export/              # trunk+heads ONNX, INT8 PTQ, TFLite conversion
 notebooks/             # runnable Kaggle entry points (data → train → export)
 tests/                 # unit tests covering all of the above
 scripts/               # notebook generator
@@ -82,8 +80,8 @@ strong accuracy/latency on CPU/NPU.
 **On MobileNetV5** (released June 2025): it is a single ~300M-parameter encoder
 built for Gemma 3n (768×768 inputs, sparse attention, RMSNorm/GELU). The only
 public pretrained weights are under the **Gemma license** and its classification
-heads are marked WIP. It is not a drop-in replacement for small edge experts, so
-MobileNetV4 remains the default. A `timm:<model>` seam is provided for
+heads are marked WIP. It is not a drop-in replacement for the compact on-device
+trunk, so MobileNetV4 remains the default. A `timm:<model>` seam is provided for
 experimentation:
 
 ```python
@@ -109,7 +107,7 @@ Each folder under `notebooks/` is one pushable Kaggle kernel (notebook +
 |----------|---------|-------------|
 | `01-data-pipeline.ipynb` | GBIF ingest → DuckDB/H3 clean → async download → curation → manifest | CPU |
 | `02-train-moe.ipynb` | build tree → MoE + loss → train (± distillation) → checkpoints | **GPU** |
-| `03-export-tflite.ipynb` | load checkpoints → per-module ONNX → INT8 → `.tflite` bundle | CPU |
+| `03-export-tflite.ipynb` | load checkpoints → trunk+heads ONNX → INT8 trunk + FP16 heads → `.tflite` bundle | CPU |
 
 Each notebook installs the package from GitHub in its setup cell
 (`GITHUB_REPO`). Artifacts flow through two public Kaggle datasets:
@@ -149,7 +147,7 @@ print(res.describe())                # deepest certain taxon + confidence
 - **DuckDB + Uber H3** for world-scale, RAM-safe occurrence cleaning and spatial
   outlier (mislabelled / lab specimen) removal.
 - **BioCLIP distillation** to transfer biologically-informed features into the
-  compact edge experts (optional, needs `transformers` + GPU).
+  shared trunk (optional, needs `transformers` + GPU).
 - **INT8 PTQ + TFLite** for NNAPI/Hexagon on-device inference.
 
 ## Dataset

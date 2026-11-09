@@ -319,10 +319,11 @@ model = HierarchicalMoE(
     tau_order=0.85, tau_levels=(0.85, 0.80, 0.70, 0.50),
 )
 n_params = sum(p.numel() for p in model.parameters())
-print(f"MoE parameters: {n_params/1e6:.2f}M across "
-      f"{len(model.family_experts)} family experts, "
-      f"{len(model.genus_experts)} genus experts, "
-      f"{len(model.species_experts)} species experts")
+n_trunk = sum(p.numel() for p in model.trunk.parameters())
+print(f"cascade parameters: {n_params/1e6:.2f}M "
+      f"(trunk {n_trunk/1e6:.2f}M + heads {(n_params-n_trunk)/1e6:.2f}M)")
+print(f"classes: {model.n_orders} orders / {model.n_families} families / "
+      f"{model.n_genera} genera / {model.n_species} species")
 '''
         ),
         md(
@@ -434,9 +435,10 @@ def build_export_nb():
         md(
             """# Open Insect ID v2 — Export to ONNX / INT8 / TFLite
 
-CPU notebook. Loads the trained MoE, exports every router + expert to ONNX,
-applies INT8 post-training quantization, and converts to `.tflite` for the
-Android app. Attach the checkpoint output-dataset from notebook 02.
+CPU notebook. Loads the trained cascade, exports the trunk + the 4 heads to
+ONNX, applies INT8 post-training quantization to the trunk, and converts to
+`.tflite` for the Android app (heads ship as FP16 matrices). Attach the
+checkpoint output-dataset from notebook 02.
 """
         ),
         code(INSTALL),
@@ -489,25 +491,26 @@ print("loaded MoE:", model.n_orders, "orders /", model.n_species, "species")
 from src.export import export_moe
 from pathlib import Path
 
+# 5 modules: trunk (image -> features) + one head per level (features ->
+# global logits); manifest.json carries labels + child ranges for slicing.
 onnx_dir = Path("export/onnx"); onnx_dir.mkdir(parents=True, exist_ok=True)
 paths = export_moe(model, onnx_dir, image_size=224)
 print(f"exported {len(paths)} modules -> {onnx_dir}")
 print("manifest:", (onnx_dir / "manifest.json").exists())
 '''
         ),
-        md("## INT8 post-training quantization (with calibration set)"),
+        md("## INT8 post-training quantization of the trunk (calibration set)"),
         code(
             '''\
 from src.export import quantize_static_int8, quantize_dynamic_int8
 import torch
 
 # Calibration images: a representative batch from your validation set.
+# (Only the trunk consumes images; the heads consume the trunk's features.)
 calib = torch.randn(64, 3, 224, 224)
 
 qdir = Path("export/onnx_int8"); qdir.mkdir(parents=True, exist_ok=True)
-# A single-order smoke tree exports no router: quantize the first exported
-# module instead so the INT8 + TFLite steps still exercise the full chain.
-module_name = "router" if "router" in paths else sorted(paths)[0]
+module_name = "trunk"
 module_onnx = onnx_dir / f"{module_name}.onnx"
 print("quantizing:", module_name)
 q = quantize_static_int8(module_onnx, qdir / f"{module_name}_int8.onnx", calib)
@@ -530,7 +533,7 @@ from src.export import TFLiteINT8Converter
 conv = TFLiteINT8Converter()
 tflite_dir = Path("export/tflite"); tflite_dir.mkdir(parents=True, exist_ok=True)
 if conv.available():
-    # Convert the INT8 (QDQ) ONNX: onnx2tf maps it to a full-INT8 .tflite.
+    # Convert the trunk's INT8 (QDQ) ONNX: onnx2tf maps it to INT8 .tflite.
     tfl = conv.convert(qdir / f"{module_name}_int8.onnx", tflite_dir, int8=True)
     print("tflite ->", tfl)
 else:
@@ -540,11 +543,38 @@ else:
 '''
         ),
         md(
+            """## Export the heads as FP16 matrices (option B)
+
+The heads are pure `Linear`s: ship them as raw `(W, b)` matrices instead of
+TFLite graphs — 4 tiny matmuls on-device, no head quantization error at 40k
+logits, and no extra interpreters. Weights are exported per level as FP16.
+"""
+        ),
+        code(
+            '''\
+import numpy as np
+
+heads_dir = Path("export/heads"); heads_dir.mkdir(parents=True, exist_ok=True)
+for level in ("order", "family", "genus", "species"):
+    head = getattr(model.heads, level)
+    if head is None:
+        continue  # single-order tree: no order head
+    np.savez(
+        heads_dir / f"head_{level}.npz",
+        weight=head.weight.detach().cpu().numpy().astype(np.float16),
+        bias=head.bias.detach().cpu().numpy().astype(np.float16),
+    )
+    print(f"head_{level}: W{tuple(head.weight.shape)} b{tuple(head.bias.shape)} -> fp16")
+print("heads ->", heads_dir)
+'''
+        ),
+        md(
             """## Package the artifact
 
-Bundle `export/tflite/`, `manifest.json`, and `taxonomy.json` into a Kaggle
-dataset (or zip for GitHub Releases). The Android app loads the router first,
-then fetches only the experts along the predicted taxonomic path (Option A).
+Bundle the INT8 trunk `.tflite`, the FP16 head matrices, `manifest.json`
+(labels + child ranges for on-device slicing), and `taxonomy.json` into a
+Kaggle dataset (or zip for GitHub Releases). On-device: run the trunk once,
+then descend the cascade with 4 head matmuls.
 """
         ),
         code(
@@ -552,7 +582,7 @@ then fetches only the experts along the predicted taxonomic path (Option A).
 import shutil, json
 bundle = Path("export/open_insect_id_bundle")
 bundle.mkdir(parents=True, exist_ok=True)
-for src in [Path("export/tflite"), onnx_dir / "manifest.json"]:
+for src in [Path("export/tflite"), Path("export/heads"), onnx_dir / "manifest.json"]:
     if src.exists():
         if src.is_dir():
             shutil.copytree(src, bundle / src.name, dirs_exist_ok=True)

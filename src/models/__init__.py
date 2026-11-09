@@ -2,14 +2,14 @@
 
 from .backbones import build_backbone
 from .taxonomy import TaxonomyTree
-from .experts import Expert
+from .heads import CascadeHeads
 from .router import TopKDecision, topk_with_threshold, prediction_entropy
 from .moe import HierarchicalMoE, LevelPrediction, CascadeResult
 
 __all__ = [
     "build_backbone",
     "TaxonomyTree",
-    "Expert",
+    "CascadeHeads",
     "TopKDecision",
     "topk_with_threshold",
     "prediction_entropy",

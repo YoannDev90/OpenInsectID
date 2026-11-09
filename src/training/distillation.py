@@ -1,8 +1,8 @@
-"""Knowledge Distillation from a BioCLIP teacher into MobileNetV4 experts.
+"""Knowledge Distillation from a BioCLIP teacher into the shared trunk.
 
 Section 2.2 of the plan: transfer BioCLIP's biologically-informed visual
 features (pretrained on the iNaturalist tree of life) into the compact
-edge-bound experts. The teacher is frozen; we match its softened logits.
+edge-bound cascade. The teacher is frozen; we match its softened logits.
 """
 
 from __future__ import annotations

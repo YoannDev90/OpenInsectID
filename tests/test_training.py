@@ -105,7 +105,9 @@ def test_step_loss_mixup_path_costs_and_backprops(tmp_path):
 
     batch = next(iter(train_loader))
     model.train()
-    loss, _ = trainer._step_loss(batch["image"], trainer._targets(batch))
+    loss, _terms, _logits = trainer._step_loss(
+        batch["image"], trainer._targets(batch)
+    )
     assert torch.isfinite(loss)
     assert loss.requires_grad
     loss.backward()
@@ -142,6 +144,40 @@ def test_checkpoint_roundtrip_and_resume(tmp_path):
     assert all(torch.equal(sd1[k], sd2[k]) for k in sd1)
     # Optimizer state survived the roundtrip (needed for real continuations).
     assert t2.optimizer.state
+
+
+def test_load_checkpoint_rejects_old_format_without_crashing(tmp_path, capsys):
+    """A checkpoint from the pre-shared-trunk architecture (stale mounted
+    dataset) must print a clear message and return 0 (train from scratch)
+    instead of raising — a Kaggle run must not die on a stale mount."""
+    import torch
+
+    from src.models import HierarchicalMoE
+    from src.training import Trainer, TrainConfig, build_dataloaders, train_transform
+
+    mpath, root = _write_tiny_manifest(tmp_path, n=8)
+    _train_loader, _val_loader, tree = build_dataloaders(
+        mpath, root, batch_size=8, val_fraction=0.25,
+        num_workers=0, transform=train_transform(image_size=224), seed=0,
+    )
+    cfg = TrainConfig(
+        epochs=1, device="cpu", use_amp=False, mixup_alpha=0.0, log_every=1,
+        ckpt_dir=str(tmp_path), ckpt_every=1,
+    )
+    trainer = Trainer(HierarchicalMoE(tree, backbone_name="mnv4_small"), cfg)
+
+    # Forge a checkpoint with foreign parameter names (old "expert" format).
+    stale = tmp_path / "stale.pt"
+    torch.save(
+        {"model": {"family_experts.0.weight": torch.zeros(1)},
+         "optimizer": trainer.optimizer.state_dict(),
+         "epoch": 3},
+        stale,
+    )
+    assert trainer.load_checkpoint(stale) == 0
+    out = capsys.readouterr().out
+    assert "incompatible architecture" in out
+    assert "training from scratch" in out
 
 
 def test_time_budget_stops_with_checkpoint(tmp_path):

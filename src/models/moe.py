@@ -1,38 +1,37 @@
-"""Hierarchical Vision MoE: a 4-level taxonomic cascade.
+"""Hierarchical Vision MoE: a 4-level taxonomic cascade on a shared trunk.
 
-Level 1: a global lightweight router (order).
-Level 2-4: specialised experts, one per parent node (family experts per order,
-genus experts per family, species experts per genus).
+Architecture (see docs/architecture-shared-trunk.md):
+
+    image -> ONE MobileNetV4 trunk -> features z (B, D)
+    z -> 4 global linear heads (order / family / genus / species), each row of
+    a head being one class weight; a parent owns the contiguous child range
+    [ranges[p], ranges[p+1]) of its head.
+
+Level 1 (order) is the unmasked root head. Levels 2-4 mask each row to the
+children of its ground-truth parent (invalid classes filled with a large
+negative constant), so the hierarchical loss consumes the same
+(B, n_classes_global) tensors as the original per-expert scatter design.
 
 Two entry points:
-- ``forward(x, targets)``: training mode. Runs the expert matching each
-  sample's ground-truth parent and scatters its logits into the global label
-  space of each level (invalid classes get a large negative fill), so the
-  hierarchical loss can consume (B, n_classes_global) tensors per level.
-- ``route(x)``: inference mode on a single image. Top-K order routing with
+- ``forward(x, targets)``: training. One trunk pass, masked heads.
+- ``forward_mix(x_a, t_a, x_b, t_b)``: mixup/CutMix. One trunk pass over the
+  concatenated batch, then the heads on each half.
+- ``route(x)``: inference on a single image. Top-K order routing with
   threshold tau_order, per-level acceptance thresholds and early stopping:
   the deepest accepted level is the answer, with an explicit uncertainty flag.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 
-from .experts import Expert
+from .backbones import build_backbone
+from .heads import CascadeHeads
 from .router import prediction_entropy, topk_with_threshold
 from .taxonomy import TaxonomyTree
-
-# Fill for classes that are not valid children of the current parent.
-# Large negative constant (not -inf) to stay safe under AMP / logsumexp.
-_NEG = -1e4
-
-
-def _sanitize(key: str) -> str:
-    return re.sub(r"[^0-9A-Za-z_-]", "_", key)
 
 
 @dataclass
@@ -93,6 +92,8 @@ class HierarchicalMoE(nn.Module):
         tau_order: float = 0.85,
         tau_levels: tuple[float, float, float, float] = (0.85, 0.80, 0.70, 0.50),
         top_k_orders: int = 2,
+        head_dim: int | None = None,
+        head_dropout: float = 0.0,
     ):
         super().__init__()
         self.tree = tree
@@ -100,7 +101,8 @@ class HierarchicalMoE(nn.Module):
         self.tau_levels = tuple(tau_levels)
         self.top_k_orders = top_k_orders
 
-        # Global label spaces (order -> family -> genus -> species).
+        # Global label spaces (order -> family -> genus -> species). Children
+        # of one parent are contiguous, matching CascadeHeads' ranges.
         self.order_names = tree.orders
         self.family_names = [f for o in self.order_names for f in tree.families_of(o)]
         self.genus_names = [
@@ -121,43 +123,25 @@ class HierarchicalMoE(nn.Module):
         self.n_genera = len(self.genus_names)
         self.n_species = len(self.species_names)
 
-        backbone_kw = dict(backbone_name=backbone_name, width_mult=width_mult)
-        # A single-order tree has nothing to route: deterministic pass-through,
-        # the same rule as single-child parents at lower levels.
-        self.router = Expert(self.n_orders, **backbone_kw) if self.n_orders >= 2 else None
+        # ONE trunk for the whole cascade (was: one full backbone per parent).
+        self.trunk = build_backbone(backbone_name, width_mult=width_mult)
+        self.heads = CascadeHeads(
+            feature_dim=self.trunk.out_channels,
+            sizes={
+                "order": self.n_orders,
+                "family": self.n_families,
+                "genus": self.n_genera,
+                "species": self.n_species,
+            },
+            children_per_parent={
+                "family": [len(tree.families_of(o)) for o in self.order_names],
+                "genus": [len(tree.genera_of(f)) for f in self.family_names],
+                "species": [len(tree.species_of(g)) for g in self.genus_names],
+            },
+            head_dim=head_dim,
+            dropout=head_dropout,
+        )
 
-        # Per-expert key = f"{global_index}_{sanitized_name}" (unique, ModuleDict-safe).
-        self._keys = {"family": [], "genus": [], "species": []}
-        self._local = {"family": {}, "genus": {}, "species": {}}  # key -> {global: local}
-        self._local_to_global = {"family": {}, "genus": {}, "species": {}}
-        self._passthrough = {"family": {}, "genus": {}, "species": {}}
-
-        self.family_experts, order_of_family = self._build_level(
-            "family",
-            [(o, tree.families_of(o)) for o in self.order_names],
-            backbone_kw,
-        )
-        self.genus_experts, family_of_genus = self._build_level(
-            "genus",
-            [(f, tree.genera_of(f)) for f in self.family_names],
-            backbone_kw,
-        )
-        self.species_experts, genus_of_species = self._build_level(
-            "species",
-            [(g, tree.species_of(g)) for g in self.genus_names],
-            backbone_kw,
-        )
-        self._parent_of = {
-            "family": order_of_family,
-            "genus": family_of_genus,
-            "species": genus_of_species,
-        }
-        # For each level, the list that maps a *parent* global index to its name.
-        self._PARENT_LIST = {
-            "family": self.order_names,
-            "genus": self.family_names,
-            "species": self.genus_names,
-        }
         self._level_index = {
             "order": {name: i for i, name in enumerate(self.order_names)},
             "family": {name: i for i, name in enumerate(self.family_names)},
@@ -165,111 +149,35 @@ class HierarchicalMoE(nn.Module):
             "species": {name: i for i, name in enumerate(self.species_names)},
         }
 
-    # ------------------------------------------------------------------ setup
-
-    def _build_level(self, level: str, groups: list[tuple[str, list[str]]], backbone_kw: dict):
-        """Instantiate experts for parents with >= 2 children.
-
-        Single-child parents become deterministic pass-throughs (no expert).
-        Returns (ModuleDict, parent_of_child: dict[child_global_idx -> parent_name]).
-        Also fills ``self._local_to_global[level][key]`` = {local_idx -> global_idx}.
-        """
-        experts = nn.ModuleDict()
-        parent_of_child: dict[int, str] = {}
-        key_lookup: dict[str, str] = {}
-        global_pos = 0
-        for parent, children in groups:
-            for local, child in enumerate(children):
-                parent_of_child[global_pos + local] = parent
-            if len(children) >= 2:
-                key = f"{global_pos}_{_sanitize(parent)}"
-                self._keys[level].append(key)
-                key_lookup[parent] = key
-                self._local[level][key] = {
-                    global_pos + local: local for local in range(len(children))
-                }
-                self._local_to_global[level][key] = {
-                    local: global_pos + local for local in range(len(children))
-                }
-                experts[key] = Expert(len(children), **backbone_kw)
-            else:
-                # Single child: class of index global_pos deterministically.
-                self._passthrough[level][parent] = global_pos
-            global_pos += len(children)
-        setattr(self, f"_key_lookup_{level}", key_lookup)
-        return experts, parent_of_child
-
     # --------------------------------------------------------------- training
 
-    def _dispatch(
-        self,
-        x: torch.Tensor,
-        parent_global: torch.Tensor,
-        experts: nn.ModuleDict,
-        level: str,
-        n_global: int,
-    ) -> torch.Tensor:
-        """Run each row's parent expert; scatter its local logits into the
-        global label space of this level (invalid classes stay at ``_NEG``)."""
-        out = x.new_full((x.size(0), n_global), _NEG)
-        parent_list = self._PARENT_LIST[level]  # parent global idx -> name
-
-        # Map each row to its expert key, or None for a pass-through parent.
-        row_key: list[str | None] = []
-        for p in parent_global.tolist():
-            parent = parent_list[int(p)]
-            if parent in self._passthrough[level]:
-                row_key.append(None)
-            else:
-                row_key.append(self._key_for_parent(level, parent))
-
-        # sorted() (not raw set iteration): expert execution order must not
-        # depend on PYTHONHASHSEED, or runs would stop being bit-identical.
-        for key in sorted(set(k for k in row_key if k is not None)):
-            rows = [i for i, k in enumerate(row_key) if k == key]
-            idx = torch.as_tensor(rows, device=x.device)
-            logits = experts[key](x[idx])  # (n, n_local)
-            gidx = torch.tensor(
-                [self._local_to_global[level][key][j] for j in range(logits.shape[1])],
-                device=x.device,
-            )
-            # Scatter every local logit to its global class position. Under AMP
-            # the expert runs in half precision while the buffer follows x's
-            # dtype: cast so index_put sees matching dtypes.
-            out[idx[:, None], gidx[None, :]] = logits.to(out.dtype)
-        # Pass-through parents: logit 0 on their single child.
-        for i, p in enumerate(parent_global.tolist()):
-            parent = parent_list[int(p)]
-            if parent in self._passthrough[level]:
-                out[i, self._passthrough[level][parent]] = 0.0
-        return out
-
-    def _key_for_parent(self, level: str, parent: str) -> str:
-        return getattr(self, f"_key_lookup_{level}")[parent]
+    def features(self, x: torch.Tensor) -> torch.Tensor:
+        """Trunk forward: images (B, 3, H, W) -> features (B, D)."""
+        return self.trunk(x)
 
     def forward(
         self, x: torch.Tensor, targets: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Training forward pass.
+        """Training forward pass (one trunk pass).
 
         ``targets`` maps each level to a (B,) LongTensor of *global* class
-        indices; the ground-truth parent selects the expert for levels 2-4.
-        Returns per-level logits (B, n_classes_global).
+        indices; the ground-truth parent masks levels 2-4. Returns per-level
+        logits (B, n_classes_global).
         """
-        out = {
-            # Single order: constant logit 0 -> probability 1.0 (pass-through).
-            "order": self.router(x) if self.router is not None else x.new_zeros((x.size(0), 1))
-        }
-        out["family"] = self._dispatch(
-            x, targets["order"], self.family_experts, "family", self.n_families
-        )
-        out["genus"] = self._dispatch(
-            x, targets["family"], self.genus_experts, "genus", self.n_genera
-        )
-        out["species"] = self._dispatch(
-            x, targets["genus"], self.species_experts, "species", self.n_species
-        )
-        return out
+        return self.heads(self.features(x), targets)
+
+    def forward_mix(
+        self,
+        x_a: torch.Tensor,
+        targets_a: dict[str, torch.Tensor],
+        x_b: torch.Tensor,
+        targets_b: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Mixup forward: ONE trunk pass over the concatenated batch, then the
+        heads applied to each half with its own targets."""
+        z = self.features(torch.cat([x_a, x_b], dim=0))
+        z_a, z_b = z.chunk(2, dim=0)
+        return self.heads(z_a, targets_a), self.heads(z_b, targets_b)
 
     # --------------------------------------------------------------- inference
 
@@ -291,8 +199,12 @@ class HierarchicalMoE(nn.Module):
         tau = self.tau_levels if tau_levels is None else tuple(tau_levels)
         k = self.top_k_orders if top_k_orders is None else top_k_orders
 
-        if self.router is not None:
-            order_probs = torch.softmax(self.router(x), dim=-1)[0]
+        # One trunk pass: every level (and every Top-K candidate branch) reuses
+        # the same features.
+        z = self.features(x)
+
+        if self.heads.order is not None:
+            order_probs = torch.softmax(self.heads.order_logits(z), dim=-1)[0]
             dec = topk_with_threshold(order_probs, tau_order, k)
             ambiguous = (not dec.confident) and k > 1
             n_candidates = k if ambiguous else 1
@@ -300,15 +212,14 @@ class HierarchicalMoE(nn.Module):
                 zip(dec.indices[:n_candidates], dec.probs[:n_candidates])
             )
         else:
-            # Single order: pass through with certainty (prob 1.0, entropy 0),
-            # mirroring the single-child pass-through of lower levels.
+            # Single order: pass through with certainty (prob 1.0, entropy 0).
             order_probs = torch.ones(1, device=x.device)
             candidates = [(0, 1.0)]
             ambiguous = False
 
         best: CascadeResult | None = None
         for order_idx, order_p in candidates:
-            res = self._descend(x, int(order_idx), float(order_p), order_probs, tau)
+            res = self._descend(z, int(order_idx), float(order_p), order_probs, tau)
             res.ambiguous_orders = ambiguous
             if best is None or res.joint_prob > best.joint_prob:
                 best = res
@@ -316,7 +227,7 @@ class HierarchicalMoE(nn.Module):
 
     def _descend(
         self,
-        x: torch.Tensor,
+        z: torch.Tensor,
         order_idx: int,
         order_p: float,
         order_probs: torch.Tensor,
@@ -335,26 +246,29 @@ class HierarchicalMoE(nn.Module):
             return res
 
         joint = order_p
-        state = (order_name, order_p)
-        for level, expert_dict, tau_level in (
-            ("family", self.family_experts, tau[1]),
-            ("genus", self.genus_experts, tau[2]),
-            ("species", self.species_experts, tau[3]),
+        # Descend: at each level the parent is the accepted child's *global*
+        # index (heads' ranges are indexed by global parent index).
+        parent_idx = order_idx
+        for level, tau_level in (
+            ("family", tau[1]),
+            ("genus", tau[2]),
+            ("species", tau[3]),
         ):
-            parent = state[0]
-            if parent in self._passthrough[level]:
-                child_idx = self._passthrough[level][parent]
+            start, end = self.heads.child_range(level, parent_idx)
+            if end - start == 1:
+                # Single child: deterministic pass-through (prob 1.0).
+                child_idx = start
                 child_name = getattr(self, f"{level}_names")[child_idx]
                 res.path.append(
                     LevelPrediction(level, child_idx, child_name, 1.0, 0.0, True)
                 )
-                state = (child_name, 1.0)
+                parent_idx = child_idx
                 continue
-            key = self._key_for_parent(level, parent)
-            probs = torch.softmax(expert_dict[key](x), dim=-1)[0]
+            logits = self.heads.child_logits(z, level, parent_idx)  # (1, n_children)
+            probs = torch.softmax(logits, dim=-1)[0]
             child_idx_local = int(probs.argmax())
             child_p = float(probs[child_idx_local])
-            child_idx = self._global_index(level, key, child_idx_local)
+            child_idx = start + child_idx_local
             child_name = getattr(self, f"{level}_names")[child_idx]
             accepted = child_p >= tau_level
             res.path.append(
@@ -367,35 +281,25 @@ class HierarchicalMoE(nn.Module):
                 res.stop_level = level
                 return res
             joint *= child_p
-            state = (child_name, child_p)
+            parent_idx = child_idx
 
         res.complete = True
         res.joint_prob = joint
         return res
 
-    def _global_index(self, level: str, key: str, local_idx: int) -> int:
-        for g, l in self._local[level][key].items():
-            if l == local_idx:
-                return g
-        raise KeyError(f"local index {local_idx} not found for {level}:{key}")
-
     # ----------------------------------------------------------------- export
 
     def export_modules(self):
-        """Yield (name, module) pairs for per-module ONNX/TFLite export.
+        """Yield (name, module) pairs for ONNX/TFLite export.
 
-        The cascade cannot be a single static graph (expert selection is data
-        dependent), so each router/expert ships as its own file — see the
-        export module and the Android loading strategy.
+        The cascade cannot be a single static graph (head selection is data
+        dependent), but the shared trunk collapses the payload to 5 modules:
+        the trunk (image -> features) plus one head per level (features ->
+        that level's global logits). The child ranges needed to slice heads
+        on-device live in the export manifest.
         """
-        if self.router is not None:
-            yield "router", self.router
-        for level, experts in (
-            ("family", self.family_experts),
-            ("genus", self.genus_experts),
-            ("species", self.species_experts),
-        ):
-            for key, module in experts.items():
-                start = int(key.split("_", 1)[0])
-                name = f"{level}_{key.split('_', 1)[1]}_{start}"
-                yield name, module
+        yield "trunk", self.trunk
+        for level in ("order", "family", "genus", "species"):
+            if level == "order" and self.heads.order is None:
+                continue  # single-order tree: nothing to route
+            yield f"head_{level}", self.heads.export_head(level)

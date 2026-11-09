@@ -166,9 +166,31 @@ class Trainer:
         Returns the epoch index ``fit()`` will resume from. RNG streams are
         restored last so training continues exactly where it left off;
         checkpoints without RNG state (older format) still load.
+
+        A checkpoint whose parameter names predate the shared-trunk
+        architecture (or otherwise mismatch) cannot resume: a clear message is
+        printed and 0 is returned (train from scratch) instead of raising, so
+        a stale mounted checkpoints dataset doesn't crash the run. Shape
+        mismatches on matching names still raise: resuming with a different
+        taxonomy is a real configuration error, not a stale-format one.
         """
         ckpt = torch.load(path, map_location="cpu")
-        self.model.load_state_dict(ckpt["model"])
+        sd = ckpt["model"]
+        try:
+            self.model.load_state_dict(sd)
+        except RuntimeError:
+            # Decide missing/unexpected keys (old format) from shape errors.
+            model_keys, ckpt_keys = set(self.model.state_dict()), set(sd)
+            if model_keys == ckpt_keys:
+                raise  # same names, different shapes: wrong tree/config
+            print(
+                f"checkpoint {path} is from an incompatible architecture "
+                f"({len(ckpt_keys - model_keys)} obsolete / "
+                f"{len(model_keys - ckpt_keys)} missing tensors): "
+                "training from scratch"
+            )
+            self.start_epoch = 0
+            return 0
         self.optimizer.load_state_dict(ckpt["optimizer"])
         if ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
@@ -199,13 +221,15 @@ class Trainer:
         }
 
     def _step_loss(self, images, targets):
-        logits = self.model(images, targets)
         if self.cfg.mixup_alpha > 0 and self.model.training:
-            # Blend targets then run two forward passes weighted by lam.
+            # Blend targets, then ONE trunk pass over the concatenated batch
+            # (forward_mix); branch A stays the clean images/targets.
             images_b, targets_b, lam = mixup_cutmix_batch(
                 images, targets, self.cfg.mixup_alpha, self.cfg.mixup_prob
             )
-            logits_b = self.model(images_b, targets_b)
+            logits, logits_b = self.model.forward_mix(
+                images, targets, images_b, targets_b
+            )
             loss = 0.0
             for lvl in ("order", "family", "genus", "species"):
                 l_a, _ = self._level_loss(logits[lvl], targets[lvl], lvl)
@@ -215,9 +239,10 @@ class Trainer:
                 logits["species"], targets["species"].clamp(min=0)
             )
             loss = loss + self.cfg.lambda_cost * cost
-            return loss, {"total": float(loss.detach())}
+            return loss, {"total": float(loss.detach())}, logits
+        logits = self.model(images, targets)
         loss, terms = self.loss_fn(logits, targets)
-        return loss, terms
+        return loss, terms, logits
 
     def _level_loss(self, logits, target, level):
         from .losses import FocalLoss
@@ -294,7 +319,7 @@ class Trainer:
                 with torch.amp.autocast(
                     self.device.type, enabled=self.cfg.use_amp and self.device.type == "cuda"
                 ):
-                    loss, terms = self._step_loss(images, targets)
+                    loss, terms, logits = self._step_loss(images, targets)
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scaler.scale(loss).backward()
@@ -308,8 +333,10 @@ class Trainer:
             bs = images.size(0)
             n += bs
             total += bs
+            # Accuracy from the step's own logits (detached): with a shared
+            # trunk a second no-grad forward would re-run the whole backbone
+            # per batch for metrics only.
             with torch.no_grad():
-                logits = self.model(images, targets)
                 for lvl in correct:
                     correct[lvl] += int((logits[lvl].argmax(-1) == targets[lvl]).sum())
         stats.seconds = time.time() - start

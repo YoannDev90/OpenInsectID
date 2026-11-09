@@ -9,8 +9,8 @@ library instead (optional dependency, e.g. ``timm:mobilenetv5_base`` for the
 MobileNetV5 encoder released in June 2025 as the Gemma 3n vision encoder).
 Note: the only pretrained MobileNetV5 weights are published under the Gemma
 license and the architecture is a ~300M-parameter encoder designed for
-768x768 inputs — useful for distillation experiments, not for small edge
-experts. MobileNetV4 Conv-S/M stays the default on-device backbone.
+768x768 inputs — useful for distillation experiments, not for the compact
+on-device trunk. MobileNetV4 Conv-S/M stays the default on-device backbone.
 """
 
 from __future__ import annotations

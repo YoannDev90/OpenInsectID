@@ -1,4 +1,4 @@
-"""Tests for the hierarchical MoE cascade: routing, thresholds, forward."""
+"""Tests for the hierarchical cascade: routing, thresholds, forward, masking."""
 
 import torch
 import pytest
@@ -57,19 +57,69 @@ def test_forward_returns_all_levels(moe):
     assert out["species"].shape == (1, moe.n_species)
 
 
-def test_dispatch_selects_correct_expert(moe):
-    # Samples from order 0 vs order 1 must use different family experts.
+def test_dispatch_masks_to_parent_children(moe):
+    """Rows are masked to the children of their ground-truth parent.
+
+    Family 0 belongs to order 0; family 2 to order 1. In the row whose parent
+    is order 0, the other order's families must sit at the _NEG fill.
+    """
     x = torch.randn(2, 3, 224, 224)
     targets = {
         "order": torch.tensor([0, 1]),
         "family": torch.tensor([0, 2]),
-        "genus": torch.tensor([0, 2]),
+        "genus": torch.tensor([0, 3]),
         "species": torch.tensor([0, 5]),
     }
     out = moe(x, targets)
-    # Invalid classes (children of other parents) must be strongly negative.
-    # Family 0 belongs to order 0; family 2 to order 1.
-    assert out["family"][0, 0] > out["family"][0, 2] or out["family"][0, 0] > -1e3
+    # Row 0 (order 0): valid family range is [0, 2) (Carabidae, Coccinellidae).
+    assert out["family"][0, 2] <= -1e3  # Nymphalidae is not a child of order 0
+    assert out["family"][1, 0] <= -1e3  # Carabidae is not a child of order 1
+
+
+def test_child_logits_match_masked_forward(moe):
+    """Sliced inference logits equal the unmasked rows of the training forward."""
+    x = torch.randn(2, 3, 224, 224)
+    targets = {
+        "order": torch.tensor([0, 1]),
+        "family": torch.tensor([0, 2]),
+        "genus": torch.tensor([0, 3]),
+        "species": torch.tensor([0, 5]),
+    }
+    z = moe.features(x)
+    out = moe.heads(z, targets)
+    # For each row, the slice of the full forward under the parent's range
+    # must equal child_logits (the inference path).
+    for row, (lvl, parent) in enumerate((("family", 0), ("genus", 0))):
+        start, end = moe.heads.child_range(lvl, parent)
+        sliced = out[lvl][0, start:end]
+        ref = moe.heads.child_logits(z[0:1], lvl, parent)[0]
+        assert torch.allclose(sliced, ref, atol=1e-5), lvl
+
+
+def test_forward_mix_matches_single_forwards(moe):
+    """forward_mix must give the same logits as two separate forwards."""
+    x_a = torch.randn(2, 3, 224, 224)
+    x_b = torch.randn(2, 3, 224, 224)
+    t_a = {
+        "order": torch.tensor([0, 1]),
+        "family": torch.tensor([0, 2]),
+        "genus": torch.tensor([0, 3]),
+        "species": torch.tensor([0, 5]),
+    }
+    t_b = {
+        "order": torch.tensor([1, 0]),
+        "family": torch.tensor([2, 1]),
+        "genus": torch.tensor([3, 2]),
+        "species": torch.tensor([4, 1]),
+    }
+    moe.eval()
+    with torch.no_grad():
+        mix_a, mix_b = moe.forward_mix(x_a, t_a, x_b, t_b)
+        ref_a = moe(x_a, t_a)
+        ref_b = moe(x_b, t_b)
+    for lvl in ("order", "family", "genus", "species"):
+        assert torch.allclose(mix_a[lvl], ref_a[lvl], atol=1e-5), lvl
+        assert torch.allclose(mix_b[lvl], ref_b[lvl], atol=1e-5), lvl
 
 
 def test_route_returns_cascade_result(moe):
@@ -109,16 +159,13 @@ def test_route_accepts_chw_tensor(moe):
     assert res.path[0].level == "order"
 
 
-def test_export_modules_covers_all_experts(moe):
+def test_export_modules_is_five_modules(moe):
     names = [n for n, _ in moe.export_modules()]
-    assert "router" in names
-    assert any(n.startswith("family_") for n in names)
-    assert any(n.startswith("genus_") for n in names)
-    assert any(n.startswith("species_") for n in names)
+    assert names == ["trunk", "head_order", "head_family", "head_genus", "head_species"]
 
 
-def test_passthrough_single_child():
-    # A family with a single genus should skip that expert (pass-through).
+def test_single_child_parent_is_pass_through():
+    # A family with a single genus should pass through deterministically.
     recs = [
         ("Coleoptera", "Carabidae", "Carabus", "Carabus auratus"),
         ("Coleoptera", "Coccinellidae", "Coccinella", "Coccinella septempunctata"),
@@ -127,9 +174,8 @@ def test_passthrough_single_child():
     ]
     t = TaxonomyTree(recs)
     m = HierarchicalMoE(t, backbone_name="mnv4_small", width_mult=0.25)
-    # Carabidae has one genus (Carabus): no genus expert keyed on it.
-    # Nymphalidae has one genus too. So genus_experts should be empty.
-    assert len(m.genus_experts) == 0
+    # Carabidae has one genus (Carabus): its genus range is size 1.
+    assert m.heads.child_range("genus", 0) == (0, 1)
     res = m.route(torch.randn(3, 224, 224), tau_order=0.0, tau_levels=(0,) * 4)
     # Cascade should still reach species via pass-through.
     assert any(p.level == "genus" for p in res.path)
@@ -145,11 +191,11 @@ SINGLE_ORDER_RECORDS = [
 ]
 
 
-def test_single_order_tree_passes_through_without_router():
-    """One order (tiny e2e manifest) must not try to build a 1-class router."""
+def test_single_order_tree_passes_through_without_order_head():
+    """One order (tiny e2e manifest) must not try to build a 1-class order head."""
     tree = TaxonomyTree(SINGLE_ORDER_RECORDS)
     model = HierarchicalMoE(tree, backbone_name="mnv4_small", width_mult=0.25)
-    assert model.router is None
+    assert model.heads.order is None
     assert model.n_orders == 1
 
     # Training forward: constant pass-through logits at the order level.
@@ -170,13 +216,13 @@ def test_single_order_tree_passes_through_without_router():
     assert res.path[0].prob == pytest.approx(1.0)
     assert res.path[0].accepted
 
-    # The absent router must not be exported.
-    assert all(name != "router" for name, _ in model.export_modules())
+    # The absent order head must not be exported.
+    assert all(name != "head_order" for name, _ in model.export_modules())
 
 
 def test_forward_under_autocast_keeps_global_buffers_fp32(moe):
-    """AMP makes expert logits bf16/fp16; the global scatter buffer (built
-    from x's dtype) must absorb them without an index_put dtype error."""
+    """AMP makes head logits bf16/fp16; the masked global-label-space output
+    must be cast back to fp32 for the loss."""
     x = torch.randn(2, 3, 224, 224)
     targets = {
         "order": torch.tensor([0, 1]),
@@ -188,3 +234,28 @@ def test_forward_under_autocast_keeps_global_buffers_fp32(moe):
         out = moe(x, targets)
     for level in ("family", "genus", "species"):
         assert out[level].dtype == torch.float32, level
+
+
+# ------------------------------------------------------------- capacity bound
+
+def test_shared_trunk_params_stay_small():
+    """At scale the model must be trunk + linear heads, not per-parent backbones.
+
+    Build a tree with many genera (the level that used to explode) and assert
+    the parameter count stays within trunk + O(D * classes).
+    """
+    recs = []
+    for gi in range(40):
+        for si in range(5):
+            recs.append((
+                "Coleoptera", f"Family{gi // 4}", f"Genus{gi}",
+                f"Genus{gi} species{si}",
+            ))
+    t = TaxonomyTree(recs)
+    m = HierarchicalMoE(t, backbone_name="mnv4_small", width_mult=1.0)
+    n = sum(p.numel() for p in m.parameters())
+    d = m.heads.feature_dim
+    classes = m.n_orders + m.n_families + m.n_genera + m.n_species
+    # 40 genera x a full backbone each would be ~175M; heads are ~D*classes.
+    assert n < 20e6, f"too many params: {n/1e6:.1f}M"
+    assert n > d * classes * 0.9  # heads alone are at least D*classes

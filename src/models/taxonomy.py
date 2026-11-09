@@ -1,9 +1,9 @@
 """Taxonomy tree utilities shared by models, training and export.
 
 The tree is built from unique species records (order, family, genus, species)
-and provides the child groupings needed by the hierarchical MoE (experts are
-instantiated per parent node) plus path-divergence helpers used by the
-hierarchical loss.
+and provides the child groupings needed by the hierarchical cascade (the
+per-parent heads discriminate between these siblings) plus path-divergence
+helpers used by the hierarchical loss.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class TaxonomyTree:
     """Order -> Family -> Genus -> Species tree derived from the dataset.
 
     Assumptions (true for GBIF Linnean taxonomy): species binomials are unique,
-    family and genus names are unique enough to use as expert keys.
+    family and genus names are unique enough to use as class keys.
     """
 
     def __init__(self, records: Iterable[SpeciesRecord | tuple[str, str, str, str]]):
@@ -93,7 +93,7 @@ class TaxonomyTree:
         return len(self._species_owner)
 
     def expert_groups(self, level: str) -> dict[str, list[str]]:
-        """Map each parent node to the class list its expert must discriminate.
+        """Map each parent node to the class list its head must discriminate.
 
         - family: order -> families
         - genus: family -> genera
