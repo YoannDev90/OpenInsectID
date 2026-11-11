@@ -269,6 +269,7 @@ def test_run_sample_retries_failed_species_within_part(tmp_path):
     """One transient failure must not sink a whole 500-species part."""
     cfg = _cfg()
     cfg.part_species = 3
+    cfg.sample_wave_pause = 0.0  # no real storm pause in tests
     census_path = write_parquet_atomic(
         _census_df([(k, 60) for k in (10, 11, 12)]), tmp_path / "census.parquet"
     )
@@ -290,10 +291,33 @@ def test_run_sample_retries_failed_species_within_part(tmp_path):
     assert attempts[10] == 1
 
 
+def test_run_sample_rescues_species_on_a_later_wave(tmp_path):
+    """A storm spanning two waves is still ridden out by wave 2+."""
+    cfg = _cfg()
+    cfg.part_species = 2
+    cfg.sample_wave_pause = 0.0
+    census_path = write_parquet_atomic(
+        _census_df([(k, 60) for k in (10, 11)]), tmp_path / "census.parquet"
+    )
+    attempts: dict[int, int] = {}
+
+    async def fetch(query):
+        key = int(dict(query)["speciesKey"])
+        attempts[key] = attempts.get(key, 0) + 1
+        if key == 11 and attempts[key] <= 2:  # fails waves 0 and 1, ok on wave 2
+            raise RuntimeError("HTTP 429 (rate limited)")
+        return {"results": [_sample_raw(key)]}
+
+    out = run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch))
+    assert len(list(out.glob("part-*.parquet"))) == 1
+    assert attempts[11] == 3
+
+
 def test_run_sample_raises_without_writing_a_partial_part(tmp_path):
     """A permanently failing species aborts the part; no half-written file."""
     cfg = _cfg()
     cfg.part_species = 3
+    cfg.sample_wave_pause = 0.0
     census_path = write_parquet_atomic(
         _census_df([(k, 60) for k in (10, 11, 12)]), tmp_path / "census.parquet"
     )
@@ -309,8 +333,33 @@ def test_run_sample_raises_without_writing_a_partial_part(tmp_path):
     with pytest.raises(RuntimeError, match="part-000000"):
         run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch))
     assert not list((tmp_path / "sampling").glob("part-*.parquet"))
-    assert attempts[11] == 2  # the one retry happened before giving up
+    assert attempts[11] == cfg.sample_waves  # every wave was tried
     assert attempts[10] == 1  # neighbours are refetched by the next run
+
+
+def test_run_sample_budget_cuts_the_retry_pause_cleanly(tmp_path):
+    """When the pause would blow the budget, stop without raising."""
+    cfg = _cfg()
+    cfg.part_species = 2
+    census_path = write_parquet_atomic(
+        _census_df([(k, 60) for k in (10, 11)]), tmp_path / "census.parquet"
+    )
+    clock = [0.0]
+
+    def now():
+        return clock[0]
+
+    async def fetch(query):
+        key = int(dict(query)["speciesKey"])
+        if key == 11:
+            raise RuntimeError("HTTP 429 (rate limited)")
+        return {"results": [_sample_raw(key)]}
+
+    # deadline = 0 + 60 s; the first retry pause (60 s) does not fit -> clean
+    # stop with the part left unwritten, no exception.
+    out = run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch,
+                               budget_min=1.0, now=now))
+    assert not list(out.glob("part-*.parquet"))
 
 
 def test_run_sample_budget_stops_between_parts_and_resumes(tmp_path):

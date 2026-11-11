@@ -80,6 +80,10 @@ class CampaignConfig:
     # Sampling: candidates gathered per species.
     sample_limit: int = 300
     part_species: int = 500
+    # A part is fetched in several waves: the initial pass plus retries that
+    # ride out GBIF throttle storms (escalating pause between waves).
+    sample_waves: int = 4
+    sample_wave_pause: float = 60.0  # s before wave n+1; x4 each, capped at 900
     # Download: what lands on disk.
     max_images_per_species: int = 150
     image_size: int = 320  # stored long side; the 224-px quality floor wins
@@ -182,11 +186,21 @@ def gbif_fetcher(session, cfg: GBIFConfig, interval: float = 0.15):
                     if resp.status == 429:
                         n429 += 1
                         gate.penalize()
-                        delay = _retry_after(resp) or min(
+                        ra = _retry_after(resp)
+                        delay = ra or min(
                             GBIF_429_BACKOFF * 2 ** (n429 - 1),
                             GBIF_429_BACKOFF * 2 ** (GBIF_429_TRIES - 1),
                         )
                         last = RuntimeError("HTTP 429 (rate limited)")
+                        # Visible in the kernel logs: silent 429s were eating
+                        # the wall clock with no trace in the previous run.
+                        log.warning(
+                            "GBIF 429 (try %d/%d, Retry-After %s): waiting %.0f s, "
+                            "pace now %.2f s/req",
+                            attempt + 1, total,
+                            f"{ra:.0f} s" if ra else "none",
+                            delay, gate.interval,
+                        )
                     elif resp.status >= 500:
                         last = RuntimeError(f"HTTP {resp.status}")
                     else:
@@ -420,11 +434,24 @@ async def run_sample(
                 payload = await fetch(sample_params(cfg, key))
             return parse_sample_page(payload, key)
 
-        # Two waves: a transient failure (429, timeout) must not sink a whole
-        # part — the species is retried once before the part is abandoned.
+        # Escalating waves ride out throttle storms: a failure retries after
+        # a pause that grows x4 each wave (60 s / 4 min / 15 min by default),
+        # so a 5-minute 429 storm never sinks a whole part. The pause is cut
+        # short by the wall-clock budget (clean stop, part for the next run).
         by_key: dict[int, list[dict]] = {}
         pending = list(chunk)
-        for wave in range(2):
+        for wave in range(cfg.sample_waves):
+            if wave:
+                pause = min(cfg.sample_wave_pause * 4 ** (wave - 1), 900.0)
+                if deadline is not None and now() + pause >= deadline:
+                    log.warning(
+                        "sample budget reached during the retry pause; part %s "
+                        "left unwritten for the next run", part.name,
+                    )
+                    return out
+                log.info("part %s: retrying %d species after %.0f s (wave %d)",
+                         part.name, len(pending), pause, wave)
+                await asyncio.sleep(pause)
             got = await asyncio.gather(
                 *(one(k) for k in pending), return_exceptions=True
             )
@@ -438,8 +465,9 @@ async def run_sample(
                 break
         if pending:
             raise RuntimeError(
-                f"part {part.name}: {len(pending)} species still failing "
-                f"(first: {pending[0]}); part left unwritten for the next run"
+                f"part {part.name}: {len(pending)} species still failing after "
+                f"{cfg.sample_waves} waves (first: {pending[0]}); part left "
+                f"unwritten for the next run"
             )
         rows = [r for k in chunk for r in by_key[k]]
         write_parquet_atomic(pl.DataFrame(rows, schema=SAMPLE_SCHEMA), part)
