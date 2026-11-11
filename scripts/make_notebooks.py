@@ -30,7 +30,7 @@ BUDGET_MIN = 300
 #   sample   -> one occurrence page per species     -> meta dataset
 #   download -> fill one shard (SHARD) with images  -> data-NN + manifest
 #   manifest -> merge the per-shard manifest parts  -> manifest dataset
-PHASE = "census"
+PHASE = "sample"
 SHARD = 0            # 0..N_SHARDS-1: shard filled by the download phase
 DL_BUDGET_MIN = 540  # wall-clock budget (minutes) for one download run
 N_SHARDS = 12        # matches CampaignConfig.n_shards and the data-NN datasets
