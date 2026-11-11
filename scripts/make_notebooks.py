@@ -171,7 +171,8 @@ def _publish(slug, folder, message, title):
         "title": title,
         "id": slug,
         "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
-        "keywords": ["classification", "research", "python", "insects"],
+        # Kaggle keywords are a closed tag list: unknown tags are dropped.
+        "keywords": ["classification", "research", "python", "beginner"],
     }))
     # -r tar: directories upload uncompressed (images mount as plain files);
     # -t: never rewrite our parquet files to CSV on upload.
