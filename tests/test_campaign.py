@@ -7,6 +7,7 @@ without any network.
 
 from __future__ import annotations
 
+import asyncio
 import zlib
 from io import BytesIO
 
@@ -19,6 +20,7 @@ from src.data_pipeline.campaign import (
     SamplingIndex,
     census_params,
     finalize_census,
+    gbif_fetcher,
     merge_manifests,
     parse_census_page,
     parse_sample_page,
@@ -32,6 +34,7 @@ from src.data_pipeline.campaign import (
     write_shard_manifest,
 )
 from src.data_pipeline._compat import run_async
+from src.data_pipeline.gbif import GBIFConfig
 
 
 def _jpeg(w: int = 400, h: int = 400, seed: int = 0) -> bytes:
@@ -262,6 +265,79 @@ def test_sampling_index_rows_and_errors(tmp_path):
         empty.rows_for(10)
 
 
+def test_run_sample_retries_failed_species_within_part(tmp_path):
+    """One transient failure must not sink a whole 500-species part."""
+    cfg = _cfg()
+    cfg.part_species = 3
+    census_path = write_parquet_atomic(
+        _census_df([(k, 60) for k in (10, 11, 12)]), tmp_path / "census.parquet"
+    )
+    attempts: dict[int, int] = {}
+
+    async def fetch(query):
+        key = int(dict(query)["speciesKey"])
+        attempts[key] = attempts.get(key, 0) + 1
+        if key == 11 and attempts[key] == 1:
+            raise RuntimeError("HTTP 429 (rate limited)")
+        return {"results": [_sample_raw(key)]}
+
+    out = run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch))
+    parts = sorted(out.glob("part-*.parquet"))
+    assert len(parts) == 1
+    got = pl.read_parquet(parts[0])["species_key"].unique().sort().to_list()
+    assert got == [10, 11, 12]
+    assert attempts[11] == 2  # retried once inside the part
+    assert attempts[10] == 1
+
+
+def test_run_sample_raises_without_writing_a_partial_part(tmp_path):
+    """A permanently failing species aborts the part; no half-written file."""
+    cfg = _cfg()
+    cfg.part_species = 3
+    census_path = write_parquet_atomic(
+        _census_df([(k, 60) for k in (10, 11, 12)]), tmp_path / "census.parquet"
+    )
+    attempts: dict[int, int] = {}
+
+    async def fetch(query):
+        key = int(dict(query)["speciesKey"])
+        attempts[key] = attempts.get(key, 0) + 1
+        if key == 11:
+            raise RuntimeError("HTTP 429 (rate limited)")
+        return {"results": [_sample_raw(key)]}
+
+    with pytest.raises(RuntimeError, match="part-000000"):
+        run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch))
+    assert not list((tmp_path / "sampling").glob("part-*.parquet"))
+    assert attempts[11] == 2  # the one retry happened before giving up
+    assert attempts[10] == 1  # neighbours are refetched by the next run
+
+
+def test_run_sample_budget_stops_between_parts_and_resumes(tmp_path):
+    cfg = _cfg()
+    cfg.part_species = 2
+    census_path = write_parquet_atomic(
+        _census_df([(k, 60) for k in (10, 11, 12, 13)]), tmp_path / "census.parquet"
+    )
+    clock = [0.0]
+
+    def now():
+        return clock[0]
+
+    async def fetch(query):
+        clock[0] += 60.0  # one species costs a minute of wall clock
+        return {"results": [_sample_raw(int(dict(query)["speciesKey"]))]}
+
+    out = run_async(
+        run_sample(cfg, census_path, tmp_path / "sampling", fetch,
+                   budget_min=1.5, now=now)
+    )
+    assert len(list(out.glob("part-*.parquet"))) == 1  # deadline hit before part 2
+    # Next run: part 1 is skipped, the remainder completes.
+    out = run_async(run_sample(cfg, census_path, tmp_path / "sampling", fetch))
+    assert len(list(out.glob("part-*.parquet"))) == 2
+
+
 # ------------------------------------------------------------------- prepare
 
 
@@ -429,3 +505,85 @@ def test_merge_manifests_adds_shard_column_deterministically(tmp_path):
     assert df["shard"].to_list() == ["data-00"] * 2 + ["data-01"] * 3
     df2 = merge_manifests([("data-00", m0), ("data-01", m1)], out)
     assert df.equals(df2)
+
+
+# ----------------------------------------------------------- gbif fetcher
+
+
+class _FakeResp:
+    def __init__(self, status: int, headers: dict | None = None):
+        self.status = status
+        self.headers = headers or {}
+
+    async def json(self):
+        return {"ok": True}
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+
+class _FakeSession:
+    """Scripted ``session.get``: one status per call, the last one sticks."""
+
+    def __init__(self, statuses: list[int], headers: dict | None = None):
+        self.statuses = statuses
+        self.headers = headers or {}
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        status = self.statuses[min(self.calls, len(self.statuses) - 1)]
+        self.calls += 1
+        headers = self.headers
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _FakeResp(status, headers)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _fake_sleep(monkeypatch) -> list[float]:
+    """Replace asyncio.sleep so backoff waits are instant and observable."""
+    sleeps: list[float] = []
+
+    async def fake(t):
+        sleeps.append(t)
+
+    monkeypatch.setattr(asyncio, "sleep", fake)
+    return sleeps
+
+
+def test_gbif_fetcher_survives_429_beyond_plain_retries(monkeypatch):
+    """A throttle storm outlives the old 3-try budget; waits double each time."""
+    sleeps = _fake_sleep(monkeypatch)
+    sess = _FakeSession([429, 429, 429, 429, 200])
+    fetch = gbif_fetcher(sess, GBIFConfig(), interval=0.0)
+    assert run_async(fetch([("q", "a")])) == {"ok": True}
+    assert sess.calls == 5  # the old fetcher raised after 3 tries
+    assert sleeps == [10.0, 20.0, 40.0, 80.0]
+
+
+def test_gbif_fetcher_honors_retry_after_header(monkeypatch):
+    sleeps = _fake_sleep(monkeypatch)
+    sess = _FakeSession([429, 200], headers={"Retry-After": "42"})
+    fetch = gbif_fetcher(sess, GBIFConfig(), interval=0.0)
+    assert run_async(fetch([("q", "a")])) == {"ok": True}
+    assert sleeps == [42.0]
+
+
+def test_gbif_fetcher_gate_adapts_pace_aimd(monkeypatch):
+    """429s halve the pace (up to the ceiling), successes give it back."""
+    _fake_sleep(monkeypatch)
+    sess = _FakeSession([429, 429, 429, 429, 200])
+    fetch = gbif_fetcher(sess, GBIFConfig(), interval=0.15)
+    assert fetch.gate.interval == 0.15
+    run_async(fetch([("q", "a")]))
+    # 4 penalties: 0.15 -> 0.3 -> 0.6 -> 1.2 -> 2.0 (ceiling); 1 relax: /2.
+    assert fetch.gate.interval == 1.0
+    for _ in range(3):  # plain successes walk the pace back to the base
+        run_async(fetch([("q", "a")]))
+    assert fetch.gate.interval == 0.15

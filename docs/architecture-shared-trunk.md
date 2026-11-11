@@ -251,7 +251,7 @@ Data-side consequences of the chosen scale (drives the data-phase flags):
 | Storage @ 320 px q85 (~28 KB/img) | ~168 GB | 256 px (~18 KB) -> ~108 GB |
 | Kaggle dataset cap | 20 GB/run output, 200 GB/dataset | shards `open-insect-id-v2-data-XX`, ~15 GB each -> **8-12 datasets** at 320 px |
 | Download wall time (CPU, ~25 img/s aggregate) | ~65-80 h | **~7-10 runs** (12 h session cap), resumable per file (downloader.py already skips existing) |
-| GBIF sampling requests | 40k (1/species) | ~2-3 h at polite rate -> 1-2 runs |
+| GBIF sampling requests | 40k (1/species) | ~2-3 h at polite rate -> 1-2 runs; load-dependent 429s absorbed by AIMD pacing + patient retries (v4 died on the first throttle storm) |
 | Training (T4, batch 128, ~400-600 img/s measured target) | ~3-4 h/epoch @ 6 M images, ~1.5x with mixup | **10-12 epochs = 45-70 h GPU** vs ~30 h quota (6 x 5 h) |
 
 GPU budget is the binding constraint. Mitigations to validate with a throughput

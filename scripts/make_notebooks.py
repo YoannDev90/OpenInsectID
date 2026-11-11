@@ -32,7 +32,7 @@ BUDGET_MIN = 300
 #   manifest -> merge the per-shard manifest parts  -> manifest dataset
 PHASE = "sample"
 SHARD = 0            # 0..N_SHARDS-1: shard filled by the download phase
-DL_BUDGET_MIN = 540  # wall-clock budget (minutes) for one download run
+RUN_BUDGET_MIN = 540 # wall-clock budget (minutes) for one sample/download run
 N_SHARDS = 12        # matches CampaignConfig.n_shards and the data-NN datasets
 
 
@@ -62,11 +62,14 @@ SETUP = """\
 #                      -> data-NN + manifest datasets
 #   PHASE="manifest"   merge the per-shard manifest parts -> manifest dataset
 #
-# PHASE / SHARD / DL_BUDGET_MIN are injected by scripts/make_notebooks.py —
+# PHASE / SHARD / RUN_BUDGET_MIN are injected by scripts/make_notebooks.py —
 # the single source of truth (edit it, regenerate, push; never edit this
-# .ipynb directly). Every phase skips artifacts that already exist, so a
-# killed session simply continues on the next run. Set the accelerator to
-# **CPU**; only the training notebook (02) needs a **GPU**.
+# .ipynb directly). Every phase skips artifacts that already exist and
+# publishes from a `finally` block, so a killed or failed session simply
+# continues on the next run without losing progress. GBIF 429 throttling
+# is absorbed by AIMD pacing + patient retries (data_pipeline.campaign).
+# Set the accelerator to **CPU**; only the training notebook (02) needs a
+# **GPU**.
 """
 
 INSTALL = """\
@@ -126,7 +129,7 @@ def build_pipeline_nb():
 # --- Run controls (injected by scripts/make_notebooks.py) -------------------
 PHASE = __PHASE__# census | sample | download | manifest
 SHARD = __SHARD__# shard filled by the download phase (0..N_SHARDS-1)
-DL_BUDGET_MIN = __DL_BUDGET_MIN__# wall-clock budget (minutes) for one download run
+RUN_BUDGET_MIN = __RUN_BUDGET_MIN__# wall-clock budget (minutes) for one sample/download run
 N_SHARDS = __N_SHARDS__# matches CampaignConfig + the data-NN datasets
 
 import json, shutil, subprocess, sys
@@ -144,7 +147,8 @@ cfg = CampaignConfig(
     # jpeg_quality=85, max_shard_bytes=18 GB (working-dir guard).
 )
 print(f"PHASE={PHASE}"
-      + (f" SHARD={SHARD:02d} budget={DL_BUDGET_MIN} min" if PHASE == "download" else ""))
+      + (f" SHARD={SHARD:02d}" if PHASE == "download" else "")
+      + (f" budget={RUN_BUDGET_MIN} min" if PHASE in ("sample", "download") else ""))
 
 # Both Kaggle mount layouts (classic + BYOD), same probe as notebooks 02/03.
 MOUNTS = [Path("/kaggle/input"), Path("/kaggle/input/datasets/yoanndev90")]
@@ -186,7 +190,7 @@ def _publish(slug, folder, message, title):
 '''
         .replace("__PHASE__", f"{PHASE!r:<26}")
         .replace("__SHARD__", f"{SHARD!r:<26}")
-        .replace("__DL_BUDGET_MIN__", f"{DL_BUDGET_MIN!r:<18}")
+        .replace("__RUN_BUDGET_MIN__", f"{RUN_BUDGET_MIN!r:<18}")
         .replace("__N_SHARDS__", f"{N_SHARDS!r:<23}")
     )
     b.cells = [
@@ -231,8 +235,12 @@ else:
 Read `census.parquet` from the attached **meta** dataset and fetch up to
 `sample_limit=300` eligible occurrences per species (lineage + image URLs),
 500 species per `part-*.parquet` in census order. Existing parts are
-skipped, so a killed run resumes at the first missing part; the merged
-**meta** dataset is republished with census + sampling."""
+skipped, so a killed run resumes at the first missing part; a species whose
+request fails is retried once inside its part (GBIF throttling is normal).
+
+Stops cleanly on `RUN_BUDGET_MIN` between parts, and the **meta** dataset is
+republished from `finally` — every part written so far survives a failed
+run, so progress is never lost."""
         ),
         code(
             '''\
@@ -249,13 +257,18 @@ else:
     census_path = work / "census.parquet"
     if not census_path.exists():
         raise SystemExit("census.parquet not found: run PHASE=census first")
-    parts = sample_sync(cfg, census_path, work / "sampling")  # parts are skipped
-    part_files = sorted(parts.glob("part-*.parquet"))
-    n_rows = sum(pl.read_parquet(p).height for p in part_files)
-    print(f"sample: {len(part_files)} parts / {n_rows} candidate rows -> {parts}")
-    _publish("yoanndev90/open-insect-id-v2-meta", work,
-             f"sample: {len(part_files)} parts / {n_rows} rows",
-             "Open Insect ID - Meta")
+    try:
+        parts = sample_sync(cfg, census_path, work / "sampling",  # skipped if present
+                            budget_min=RUN_BUDGET_MIN)
+    finally:
+        # Publish on success AND on failure: a raised run still ships every
+        # part it managed to write (the next run resumes from those).
+        part_files = sorted((work / "sampling").glob("part-*.parquet"))
+        n_rows = sum(pl.read_parquet(p).height for p in part_files)
+        print(f"sample: {len(part_files)} parts / {n_rows} candidate rows")
+        _publish("yoanndev90/open-insect-id-v2-meta", work,
+                 f"sample: {len(part_files)} parts / {n_rows} rows",
+                 "Open Insect ID - Meta")
 '''
         ),
         md(
@@ -267,10 +280,11 @@ shard's species from the sampling index: fetch → curate (224-px floor,
 aspect ≤ 3) → resize to 320 px → q85 JPEG, content-hash named under
 `order/family/genus/species/`, capped at `max_images_per_species`.
 
-Stops cleanly on `DL_BUDGET_MIN` or the 18 GB working-dir guard; the next
+Stops cleanly on `RUN_BUDGET_MIN` or the 18 GB working-dir guard; the next
 run continues, skipping species that are already full without spending
-network. Finishes by writing the shard manifest, pushing the shard, then
-this shard's manifest part."""
+network. The shard manifest + both pushes run from `finally`: even a
+crashed run ships the images it downloaded (shard first, then this
+shard's manifest part — a lagging part under-lists, which is safe)."""
         ),
         code(
             '''\
@@ -302,26 +316,32 @@ else:
 
     index = SamplingIndex(meta / "census.parquet", meta / "sampling",
                           part_size=cfg.part_species)
-    stats = download_sync(cfg, work, keys, index, budget_min=DL_BUDGET_MIN)
-    print("download:", stats)
+    stats = {"ok": 0}  # so the finally below can report a crashed run
+    try:
+        stats = download_sync(cfg, work, keys, index, budget_min=RUN_BUDGET_MIN)
+        print("download:", stats)
+    finally:
+        # Publish on success AND on failure: images already on disk are
+        # never thrown away (a kill mid-push loses at most this run's tail).
+        work.mkdir(parents=True, exist_ok=True)
+        manifest = write_shard_manifest(work)
+        rows = pl.read_parquet(manifest).height
+        print(f"shard manifest: {rows} images -> {manifest}")
 
-    manifest = write_shard_manifest(work)
-    rows = pl.read_parquet(manifest).height
-    print(f"shard manifest: {rows} images -> {manifest}")
-
-    # Shard first: a manifest part that lags behind under-lists images (safe —
-    # the next run heals it); the reverse order could list missing files.
-    _publish(f"yoanndev90/{shard_id}", work,
-             f"shard {SHARD:02d}: +{stats['ok']} images ({rows} total)",
-             f"Open Insect ID - Data {SHARD:02d}")
-    mwork = Path("manifest")
-    msrc = _input("open-insect-id-v2-manifest")
-    if msrc is not None:
-        shutil.copytree(msrc, mwork, dirs_exist_ok=True)
-    mwork.mkdir(exist_ok=True)
-    shutil.copy(manifest, mwork / f"data-{SHARD:02d}.parquet")
-    _publish("yoanndev90/open-insect-id-v2-manifest", mwork,
-             f"part data-{SHARD:02d}: {rows} images", "Open Insect ID - Manifest")
+        # Shard first: a manifest part that lags behind under-lists images
+        # (safe — the next run heals it); the reverse order could list
+        # missing files.
+        _publish(f"yoanndev90/{shard_id}", work,
+                 f"shard {SHARD:02d}: +{stats['ok']} images ({rows} total)",
+                 f"Open Insect ID - Data {SHARD:02d}")
+        mwork = Path("manifest")
+        msrc = _input("open-insect-id-v2-manifest")
+        if msrc is not None:
+            shutil.copytree(msrc, mwork, dirs_exist_ok=True)
+        mwork.mkdir(exist_ok=True)
+        shutil.copy(manifest, mwork / f"data-{SHARD:02d}.parquet")
+        _publish("yoanndev90/open-insect-id-v2-manifest", mwork,
+                 f"part data-{SHARD:02d}: {rows} images", "Open Insect ID - Manifest")
 '''
         ),
         md(

@@ -104,11 +104,26 @@ def write_parquet_atomic(df: pl.DataFrame, path: str | Path) -> Path:
     return path
 
 
-class RequestGate:
-    """Spaces request starts by >= interval while allowing overlap."""
+# GBIF throttles "depending on server load": a 429 is normal, not an error.
+# It gets a patient budget of its own (doubling waits, Retry-After honoured)
+# on top of the regular transient retries, and halves the request pace.
+GBIF_429_TRIES = 5
+GBIF_429_BACKOFF = 10.0  # s before the first 429 retry; doubles each time
+GBIF_MAX_INTERVAL = 2.0  # AIMD ceiling for the gate (base interval 0.15 s)
 
-    def __init__(self, interval: float):
+
+class RequestGate:
+    """Spaces request starts by >= interval while allowing overlap.
+
+    ``penalize``/``relax`` implement AIMD pacing: a 429 doubles the interval
+    (up to ``ceiling``), each success halves it back toward the base — GBIF's
+    limit moves with server load, so the pace must adapt both ways.
+    """
+
+    def __init__(self, interval: float, ceiling: float = GBIF_MAX_INTERVAL):
+        self.base = interval
         self.interval = interval
+        self.ceiling = ceiling
         self._lock = asyncio.Lock()
         self._next = 0.0
 
@@ -120,34 +135,71 @@ class RequestGate:
         if wait > 0:
             await asyncio.sleep(wait)
 
+    def penalize(self) -> None:
+        """On HTTP 429: halve throughput by doubling the pacing interval."""
+        self.interval = min(self.interval * 2, self.ceiling)
+
+    def relax(self) -> None:
+        """On success: undo half of the throttling, never below the base."""
+        if self.interval > self.base:
+            self.interval = max(self.interval / 2, self.base)
+
+
+def _retry_after(resp) -> float | None:
+    """Seconds from a sane ``Retry-After`` header, if the response carries one."""
+    try:
+        value = float(resp.headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value <= 300 else None
+
 
 def gbif_fetcher(session, cfg: GBIFConfig, interval: float = 0.15):
-    """Async ``fetch(query) -> dict`` with pacing, retries and 429 backoff."""
+    """Async ``fetch(query) -> dict`` with pacing, retries and 429 backoff.
+
+    Load-dependent 429s are not plain retries: each one halves the request
+    pace (AIMD, restored on success) and waits a patient doubling delay
+    (honouring ``Retry-After``) out of a dedicated ``GBIF_429_TRIES`` budget,
+    so a throttle storm can't sink a whole part after 3 quick attempts.
+    """
     gate = RequestGate(interval)
 
     async def fetch(query: list[tuple[str, str]]) -> dict:
         import aiohttp
 
         last: Exception | None = None
-        for attempt in range(cfg.max_retries):
+        n429 = 0
+        total = cfg.max_retries + GBIF_429_TRIES
+        for attempt in range(total):
             await gate.wait()
+            delay = cfg.backoff ** attempt
             try:
                 async with session.get(
                     GBIF_SEARCH_URL,
                     params=query,
                     timeout=aiohttp.ClientTimeout(total=cfg.timeout),
                 ) as resp:
-                    if resp.status == 429 or resp.status >= 500:
-                        await asyncio.sleep(cfg.backoff ** attempt * (2 if resp.status == 429 else 1))
+                    if resp.status == 429:
+                        n429 += 1
+                        gate.penalize()
+                        delay = _retry_after(resp) or min(
+                            GBIF_429_BACKOFF * 2 ** (n429 - 1),
+                            GBIF_429_BACKOFF * 2 ** (GBIF_429_TRIES - 1),
+                        )
+                        last = RuntimeError("HTTP 429 (rate limited)")
+                    elif resp.status >= 500:
                         last = RuntimeError(f"HTTP {resp.status}")
-                        continue
-                    resp.raise_for_status()
-                    return await resp.json()
+                    else:
+                        resp.raise_for_status()
+                        gate.relax()
+                        return await resp.json()
             except Exception as e:  # noqa: BLE001 - retry any transient error
                 last = e
-                await asyncio.sleep(cfg.backoff ** attempt)
-        raise RuntimeError(f"GBIF request failed after {cfg.max_retries} tries: {last}")
+            if attempt + 1 < total:  # never sleep after the final try
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"GBIF request failed after {total} tries: {last}")
 
+    fetch.gate = gate  # exposed for tests: observe the AIMD pace
     return fetch
 
 
@@ -329,13 +381,24 @@ def parse_sample_page(payload: dict, species_key: int) -> list[dict]:
 
 
 async def run_sample(
-    cfg: CampaignConfig, census_path: str | Path, out_dir: str | Path, fetch
+    cfg: CampaignConfig,
+    census_path: str | Path,
+    out_dir: str | Path,
+    fetch,
+    *,
+    budget_min: float = 0.0,
+    now=None,
 ) -> Path:
     """Sample every census species into deterministic part files.
 
     Parts that already exist are skipped, so an interrupted run resumes at the
-    first missing part (500 species per part, census order).
+    first missing part (500 species per part, census order). A species whose
+    request fails is retried once inside the part; a part that still has
+    failures raises WITHOUT being written (the next run refetches only that
+    part). ``budget_min`` stops cleanly between parts, leaving the rest queued.
     """
+    now = now or time.monotonic
+    deadline = now() + budget_min * 60 if budget_min > 0 else None
     keys = pl.read_parquet(census_path)["species_key"].to_list()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -344,6 +407,12 @@ async def run_sample(
         part = out / f"part-{start:06d}.parquet"
         if part.exists():
             continue
+        if deadline is not None and now() >= deadline:
+            log.info(
+                "sample budget reached: %d/%d species done, next run resumes here",
+                start, len(keys),
+            )
+            break
         chunk = keys[start : start + cfg.part_species]
 
         async def one(key: int) -> list[dict]:
@@ -351,20 +420,47 @@ async def run_sample(
                 payload = await fetch(sample_params(cfg, key))
             return parse_sample_page(payload, key)
 
-        lists = await asyncio.gather(*(one(k) for k in chunk))
-        rows = [r for lst in lists for r in lst]
+        # Two waves: a transient failure (429, timeout) must not sink a whole
+        # part — the species is retried once before the part is abandoned.
+        by_key: dict[int, list[dict]] = {}
+        pending = list(chunk)
+        for wave in range(2):
+            got = await asyncio.gather(
+                *(one(k) for k in pending), return_exceptions=True
+            )
+            for k, r in zip(pending, got):
+                if isinstance(r, BaseException):
+                    log.warning("sample species %s failed (wave %d): %r", k, wave, r)
+                else:
+                    by_key[k] = r
+            pending = [k for k in pending if k not in by_key]
+            if not pending:
+                break
+        if pending:
+            raise RuntimeError(
+                f"part {part.name}: {len(pending)} species still failing "
+                f"(first: {pending[0]}); part left unwritten for the next run"
+            )
+        rows = [r for k in chunk for r in by_key[k]]
         write_parquet_atomic(pl.DataFrame(rows, schema=SAMPLE_SCHEMA), part)
         log.info("sampled part %s: %d species, %d candidate rows", part.name, len(chunk), len(rows))
     return out
 
 
-def sample_sync(cfg: CampaignConfig, census_path: str | Path, out_dir: str | Path) -> Path:
+def sample_sync(
+    cfg: CampaignConfig,
+    census_path: str | Path,
+    out_dir: str | Path,
+    budget_min: float = 0.0,
+) -> Path:
     async def go():
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
             fetch = gbif_fetcher(session, cfg.gbif, cfg.request_interval)
-            return await run_sample(cfg, census_path, out_dir, fetch)
+            return await run_sample(
+                cfg, census_path, out_dir, fetch, budget_min=budget_min
+            )
 
     return run_async(go())
 
