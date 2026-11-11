@@ -394,7 +394,8 @@ def build_train_nb():
             """# Open Insect ID v2 — Train the hierarchical Vision MoE
 
 Set the accelerator to **GPU**. This notebook:
-1. loads the curated manifest + images (attached as a Kaggle input dataset),
+1. loads the merged manifest + images (attached as the manifest and
+   per-shard `data-NN` input datasets),
 2. builds the taxonomy tree,
 3. constructs the 4-level MoE, the hierarchical + focal + cost-matrix loss,
 4. trains with optional Mixup/CutMix and BioCLIP distillation,
@@ -430,6 +431,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 RESUME = __RESUME__       # False ignores existing checkpoints (from-scratch runs)
 BUDGET_MIN = __BUDGET_MIN__    # wall-clock budget in minutes (0 = unlimited); on expiry
                     # training stops cleanly with a checkpoint to resume from
+N_SHARDS = __N_SHARDS__    # data-NN shard datasets attached as image roots
 cfg = TrainConfig(
     epochs=30, lr=1e-3, weight_decay=1e-4,
     level_weights=(8.0, 4.0, 2.0, 1.0),   # order >> species
@@ -443,27 +445,48 @@ cfg = TrainConfig(
     ckpt_dir="checkpoints", ckpt_every=5, max_minutes=BUDGET_MIN,
 )
 print("device:", device)
-'''.replace("__RESUME__", str(RESUME)).replace("__BUDGET_MIN__", str(BUDGET_MIN))
+'''.replace("__RESUME__", str(RESUME))
+   .replace("__BUDGET_MIN__", str(BUDGET_MIN))
+   .replace("__N_SHARDS__", str(N_SHARDS))
         ),
         md("## Load manifest + build tree"),
         code(
             '''\
-# On Kaggle, point these at your attached input dataset. Kaggle mounts inputs
-# at /kaggle/input/<slug> on the classic runtime and at
-# /kaggle/input/datasets/<owner>/<slug> on the newer BYOD runtime: probe both.
+# Campaign layout: the merged manifest lives in its own dataset, images live
+# in one mounted dataset per shard, and the manifest's `shard` column
+# (data-NN) maps every row to its mounted root. Both Kaggle mount layouts
+# (classic + BYOD) are probed; a smoke dataset / local folder is the
+# fallback for single-root runs.
 from pathlib import Path
 
 MOUNTS = [Path("/kaggle/input"), Path("/kaggle/input/datasets/yoanndev90")]
-def _input(*rel):
+def _input(slug, *rel):
     for base in MOUNTS:
-        p = base.joinpath("open-insect-id-v2", *rel)
+        p = base.joinpath(slug, *rel)
         if p.exists():
             return p
     return None
 
-MANIFEST, IMAGE_ROOT = _input("insectid_manifest.parquet"), _input("images")
-if MANIFEST is None:  # local run
-    MANIFEST, IMAGE_ROOT = Path("insectid_manifest.parquet"), Path("data/raw")
+MANIFEST = _input("open-insect-id-v2-manifest", "insectid_manifest.parquet")
+IMAGE_ROOT = None
+if MANIFEST is not None:
+    roots, missing = {}, []
+    for i in range(N_SHARDS):
+        root = _input(f"open-insect-id-v2-data-{i:02d}")
+        if root is not None:
+            roots[f"data-{i:02d}"] = root
+        else:
+            missing.append(f"data-{i:02d}")
+    if missing:
+        raise SystemExit(f"mounted image shards missing: {missing} — attach "
+                         f"all open-insect-id-v2-data-NN datasets")
+    IMAGE_ROOT = roots
+else:
+    smoke = _input("open-insect-id-v2", "insectid_manifest.parquet")
+    MANIFEST = smoke or Path("insectid_manifest.parquet")
+    IMAGE_ROOT = (_input("open-insect-id-v2", "images") or Path("data/raw"))
+print(f"manifest: {MANIFEST}")
+print(f"image roots: {len(IMAGE_ROOT) if isinstance(IMAGE_ROOT, dict) else 1}")
 
 train_loader, val_loader, tree = build_dataloaders(
     MANIFEST, IMAGE_ROOT, batch_size=128,
@@ -829,10 +852,13 @@ def main():
             lambda: build_train_nb(),
             "Open Insect ID v2 - Train Vision MoE",
             True,
-            # The checkpoints dataset doubles as resume source (mounted
-            # last.pt) and as the output consumed by notebook 03.
+            # Merged manifest + every shard dataset (multi-root images) +
+            # the checkpoints dataset, which doubles as resume source
+            # (mounted last.pt) and as the output consumed by notebook 03.
             [
-                "yoanndev90/open-insect-id-v2",
+                "yoanndev90/open-insect-id-v2-manifest",
+                *(f"yoanndev90/open-insect-id-v2-data-{i:02d}"
+                  for i in range(N_SHARDS)),
                 "yoanndev90/open-insect-id-checkpoints",
             ],
         ),
