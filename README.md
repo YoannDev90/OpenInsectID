@@ -105,17 +105,21 @@ Each folder under `notebooks/` is one pushable Kaggle kernel (notebook +
 
 | Notebook | Purpose | Accelerator |
 |----------|---------|-------------|
-| `01-data-pipeline.ipynb` | GBIF ingest → DuckDB/H3 clean → async download → curation → manifest | CPU |
+| `01-data-pipeline.ipynb` | data campaign: GBIF census → sampling → shard download (curate + 320-px resize) → merged manifest | CPU |
 | `02-train-moe.ipynb` | build tree → MoE + loss → train (± distillation) → checkpoints | **GPU** |
 | `03-export-tflite.ipynb` | load checkpoints → trunk+heads ONNX → INT8 trunk + FP16 heads → `.tflite` bundle | CPU |
 
 Each notebook installs the package from GitHub in its setup cell
-(`GITHUB_REPO`). Artifacts flow through two public Kaggle datasets:
+(`GITHUB_REPO`). Artifacts flow through Kaggle datasets: the smoke dataset
 [yoanndev90/open-insect-id-v2](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-v2)
-(curated manifest + images, published by `01`) and
+(curated manifest + images),
 [yoanndev90/open-insect-id-checkpoints](https://www.kaggle.com/datasets/yoanndev90/open-insect-id-checkpoints)
 (trained `moe_state.pt` + `taxonomy.json`, published by `02` on its first
-run). Notebook `02` attaches the former as an input, `03` the latter.
+run), and — for the 40k-species campaign — `open-insect-id-v2-meta` (census +
+sampling), `open-insect-id-v2-data-00..11` (image shards) and
+`open-insect-id-v2-manifest` (per-shard manifest parts + the merged training
+manifest), all published by `01` depending on its `PHASE`. Notebook `02`
+consumes the manifest + shards, `03` the checkpoints.
 
 Training is **resumable**: `02` checkpoints model + optimizer every 5 epochs
 (`checkpoints/last.pt`, also pushed to the checkpoints dataset) and stops

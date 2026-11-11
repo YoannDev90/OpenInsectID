@@ -87,7 +87,8 @@ class ImageDownloader:
             self._limiters[host] = _DomainLimiter(self.config.per_domain_rps)
         return self._limiters[host]
 
-    async def _fetch(self, session, url: str) -> bytes | None:
+    async def fetch(self, session, url: str) -> bytes | None:
+        """Download one URL with per-domain rate limiting and retries."""
         import aiohttp
 
         limiter = self._limiter(url)
@@ -123,7 +124,7 @@ class ImageDownloader:
                 base = root / self.relative_path(record)
                 async with sem:
                     for url in record.image_urls:
-                        data = await self._fetch(session, url)
+                        data = await self.fetch(session, url)
                         if data is None:
                             self._results.failed += 1
                             continue

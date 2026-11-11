@@ -1,12 +1,17 @@
 """Dataset over the curated image manifest (Parquet).
 
 Manifest schema (one row per curated image), produced by the data pipeline:
-    image_path : relative path under the image root
+    image_path : relative path under the image root (or under the row's shard)
     order      : taxonomic order name
     family     : taxonomic family name
     genus      : taxonomic genus name
     species    : taxonomic species (binomial) name
+    shard      : [optional] dataset slug owning the row (campaign manifests)
     [optional] h3_cell, lat, lon, occurrence_id, media_url
+
+``image_root`` is either one directory or, for campaign manifests with a
+``shard`` column, a ``{slug: root}`` mapping resolved per row (each shard is
+a separately mounted Kaggle dataset).
 
 Targets are global class indices at each level, aligned with the label spaces
 of ``HierarchicalMoE`` (order/family/genus/species).
@@ -47,7 +52,8 @@ class InsectDataset(Dataset):
         import polars as pl
 
         self.manifest_path = Path(manifest_path)
-        self.image_root = Path(image_root)
+        # Single root (Path) or {shard slug -> root} for campaign manifests.
+        self.image_root = image_root if isinstance(image_root, dict) else Path(image_root)
         self.transform = transform
 
         df = pl.read_parquet(self.manifest_path)
@@ -55,6 +61,10 @@ class InsectDataset(Dataset):
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Manifest missing columns: {sorted(missing)}")
+        if isinstance(image_root, dict) and "shard" not in df.columns:
+            raise ValueError(
+                "Multi-root image_root requires a 'shard' column in the manifest"
+            )
         self.df = df
 
         # Taxonomy tree / label spaces.
@@ -76,9 +86,20 @@ class InsectDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
+    def _root_for(self, row: dict) -> Path:
+        if isinstance(self.image_root, dict):
+            slug = row.get("shard")
+            if slug not in self.image_root:
+                raise KeyError(
+                    f"no mounted root for shard {slug!r} "
+                    f"(have: {sorted(self.image_root)})"
+                )
+            return self.image_root[slug]
+        return self.image_root
+
     def __getitem__(self, idx: int) -> dict:
         row = self.df.row(idx, named=True)
-        img = Image.open(self.image_root / row["image_path"]).convert("RGB")
+        img = Image.open(self._root_for(row) / row["image_path"]).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
         else:

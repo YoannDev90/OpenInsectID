@@ -6,6 +6,15 @@ from .gbif import GBIFExtractor, GBIFConfig, TaxonLineage
 from .spatial import SpatialProcessor, H3Config
 from .downloader import ImageDownloader, DownloadConfig
 from .curation import CurationConfig, curate_image, curate_directory
+from .campaign import (
+    CampaignConfig,
+    SamplingIndex,
+    census_sync,
+    sample_sync,
+    download_sync,
+    merge_manifests,
+    write_shard_manifest,
+)
 
 __all__ = [
     "GBIFExtractor",
@@ -18,4 +27,11 @@ __all__ = [
     "CurationConfig",
     "curate_image",
     "curate_directory",
+    "CampaignConfig",
+    "SamplingIndex",
+    "census_sync",
+    "sample_sync",
+    "download_sync",
+    "merge_manifests",
+    "write_shard_manifest",
 ]

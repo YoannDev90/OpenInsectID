@@ -58,8 +58,10 @@ One row per curated image (Parquet):
 
 ## Reproduce
 
-See `notebooks/01-data-pipeline/01-data-pipeline.ipynb`, which performs
-ingestion, spatial cleaning, download, curation, and manifest export.
+See `notebooks/01-data-pipeline/01-data-pipeline.ipynb`: a four-phase Kaggle
+campaign (`census` → `sample` → `download` → `manifest`) that pages GBIF,
+downloads and curates images into 320-px shards, and publishes the merged
+manifest.
 
 ## License & attribution
 

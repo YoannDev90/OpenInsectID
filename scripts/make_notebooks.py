@@ -23,7 +23,17 @@ NB_DIR.mkdir(exist_ok=True)
 # Seamless resume holds iff H_beta == H_gamma (same git commit for all three).
 RESUME = True
 BUDGET_MIN = 300
-SMALL_N = 10  # records downloaded by the data-pipeline smoke run
+
+# Data-campaign phase for notebook 01 — same local-edit workflow as the
+# training knobs above (edit here, regenerate, push; never edit the .ipynb):
+#   census   -> page the GBIF speciesKey facet      -> meta dataset
+#   sample   -> one occurrence page per species     -> meta dataset
+#   download -> fill one shard (SHARD) with images  -> data-NN + manifest
+#   manifest -> merge the per-shard manifest parts  -> manifest dataset
+PHASE = "census"
+SHARD = 0            # 0..N_SHARDS-1: shard filled by the download phase
+DL_BUDGET_MIN = 540  # wall-clock budget (minutes) for one download run
+N_SHARDS = 12        # matches CampaignConfig.n_shards and the data-NN datasets
 
 
 def nb():
@@ -39,15 +49,24 @@ def code(src):
 
 
 SETUP = """\
-# Open Insect ID v2 — Kaggle pipeline
+# Open Insect ID v2 — data campaign (Kaggle)
 #
-# This notebook is the runnable, on-Kaggle entry point. It installs the
-# `src` package from GitHub and exercises the full data pipeline. Set the
-# accelerator to **CPU** for the data stages (GPU is not needed) and use the
-# training notebook (02) with a **GPU**.
+# CPU notebook driving the 40k-species x 150-images campaign (architecture
+# doc section 9): four resumable phases, one per run, each publishing the
+# Kaggle dataset consumed by the next phase and by the training notebook
+# (02):
 #
-# Fill in `GITHUB_REPO` below with your repository URL (or use the local copy
-# already in the Kaggle notebook's working directory).
+#   PHASE="census"     page GBIF's speciesKey facet   -> meta dataset
+#   PHASE="sample"     one occurrence page per species -> meta dataset
+#   PHASE="download"   fill one shard (SHARD) with curated 320-px images
+#                      -> data-NN + manifest datasets
+#   PHASE="manifest"   merge the per-shard manifest parts -> manifest dataset
+#
+# PHASE / SHARD / DL_BUDGET_MIN are injected by scripts/make_notebooks.py —
+# the single source of truth (edit it, regenerate, push; never edit this
+# .ipynb directly). Every phase skips artifacts that already exist, so a
+# killed session simply continues on the next run. Set the accelerator to
+# **CPU**; only the training notebook (02) needs a **GPU**.
 """
 
 INSTALL = """\
@@ -102,123 +121,245 @@ print("package ready; importable as `src.*`")
 
 def build_pipeline_nb():
     b = nb()
+    controls = (
+        '''\
+# --- Run controls (injected by scripts/make_notebooks.py) -------------------
+PHASE = __PHASE__# census | sample | download | manifest
+SHARD = __SHARD__# shard filled by the download phase (0..N_SHARDS-1)
+DL_BUDGET_MIN = __DL_BUDGET_MIN__# wall-clock budget (minutes) for one download run
+N_SHARDS = __N_SHARDS__# matches CampaignConfig + the data-NN datasets
+
+import json, shutil, subprocess, sys
+from pathlib import Path
+
+import polars as pl
+
+from src.data_pipeline import CampaignConfig
+
+cfg = CampaignConfig(
+    target_species=40_000,
+    n_shards=N_SHARDS,
+    # Section-9 defaults: min_occurrences=50, facet_page=1000, sample_limit=300,
+    # part_species=500, max_images_per_species=150, image_size=320,
+    # jpeg_quality=85, max_shard_bytes=18 GB (working-dir guard).
+)
+print(f"PHASE={PHASE}"
+      + (f" SHARD={SHARD:02d} budget={DL_BUDGET_MIN} min" if PHASE == "download" else ""))
+
+# Both Kaggle mount layouts (classic + BYOD), same probe as notebooks 02/03.
+MOUNTS = [Path("/kaggle/input"), Path("/kaggle/input/datasets/yoanndev90")]
+
+def _input(slug):
+    """Attached dataset root, or None when it is not mounted."""
+    for base in MOUNTS:
+        p = base / slug
+        if p.exists():
+            return p
+    return None
+
+def _publish(slug, folder, message, title):
+    """Push `folder` as the next version of dataset `slug` (Kaggle runs only)."""
+    folder = Path(folder)
+    if not IS_KAGGLE:
+        print(f"local run: {folder} not pushed -> {slug}")
+        return
+    # The preinstalled CLI (2.0.2) mangles license/keywords on version
+    # pushes — upgrade it first (same guard as notebook 02).
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
+                   check=False)
+    (folder / "dataset-metadata.json").write_text(json.dumps({
+        "title": title,
+        "id": slug,
+        "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
+        "keywords": ["classification", "research", "python", "insects"],
+    }))
+    # -r tar: directories upload uncompressed (images mount as plain files);
+    # -t: never rewrite our parquet files to CSV on upload.
+    r = subprocess.run(
+        ["kaggle", "datasets", "version", "-p", str(folder),
+         "-m", message, "-r", "tar", "-t", "-q"],
+        capture_output=True, text=True,
+    )
+    print(f"push {slug} rc:", r.returncode, "|",
+          (r.stdout + r.stderr).strip() or "ok")
+'''
+        .replace("__PHASE__", f"{PHASE!r:<26}")
+        .replace("__SHARD__", f"{SHARD!r:<26}")
+        .replace("__DL_BUDGET_MIN__", f"{DL_BUDGET_MIN!r:<18}")
+        .replace("__N_SHARDS__", f"{N_SHARDS!r:<23}")
+    )
     b.cells = [
         md(SETUP),
         md("## 1. Setup & configuration"),
         code(INSTALL),
+        code(controls),
+        md(
+            """## 2. `PHASE="census"` — which species are worth sampling
+
+Page GBIF's `speciesKey` facet (Insecta, still images, PRESENT, human or
+preserved records, has coordinate, `>= min_occurrences` eligible
+occurrences) until a short page, then merge into `meta/census.parquet` plus
+the deterministic `meta/shards.parquet` species→shard assignment (balanced
+by estimated images, top `target_species`). Publishes the **meta** dataset.
+
+Existing facet pages are skipped: a killed run resumes at the first missing
+page. This phase attaches nothing."""
+        ),
         code(
             '''\
-# Load the data pipeline configuration (filters, H3 resolution, curation).
-from src.data_pipeline import GBIFConfig, H3Config, CurationConfig, DownloadConfig
+if PHASE != "census":
+    print(f"skipped: PHASE={PHASE!r} (this cell runs the census)")
+else:
+    from src.data_pipeline import census_sync
 
-gbif_cfg = GBIFConfig(
-    class_key=216,               # Insecta
-    media_type="StillImage",
-    occurrence_status="PRESENT",
-    basis_of_record=("HUMAN_OBSERVATION", "PRESERVED_SPECIMEN"),
-    has_coordinate=True,
-)
-h3_cfg = H3Config(resolution=4, min_occurrences_per_cell=3)
-cur_cfg = CurationConfig(min_resolution=224, max_aspect_ratio=3.0)
-dl_cfg = DownloadConfig(concurrency=8, per_domain_rps=4.0, raw_root="data/raw")
-print("Insecta, world-scale, H3 res", h3_cfg.resolution)
+    out = Path("meta")
+    census_path = census_sync(cfg, out)   # stored pages are never refetched
+    census = pl.read_parquet(census_path)
+    plan = pl.read_parquet(out / "shards.parquet")
+    print(f"census: {census.height} species with >= {cfg.min_occurrences} "
+          f"eligible occurrences")
+    print(f"shards: {plan.height} species -> {plan['shard'].n_unique()} shards, "
+          f"est. {plan['est_images'].sum():,} images")
+    _publish("yoanndev90/open-insect-id-v2-meta", out,
+             f"census: {census.height} species", "Open Insect ID - Meta")
 '''
         ),
         md(
-            """## 2. Ingest occurrences (GBIF)
+            """## 3. `PHASE="sample"` — one occurrence page per census species
 
-Two interchangeable sources:
-- **A. Async API** (`GBIFExtractor`) — best for a targeted slice / prototyping.
-- **B. DuckDB over a bulk TSV** (`SpatialProcessor.load_occurrences`) — best for
-  the full world-scale dump (tens of millions of rows) streamed off disk.
-"""
+Read `census.parquet` from the attached **meta** dataset and fetch up to
+`sample_limit=300` eligible occurrences per species (lineage + image URLs),
+500 species per `part-*.parquet` in census order. Existing parts are
+skipped, so a killed run resumes at the first missing part; the merged
+**meta** dataset is republished with census + sampling."""
         ),
         code(
             '''\
-# --- Option A: async GBIF occurrence search (prototype / bounded slice) ------
-from src.data_pipeline import GBIFExtractor
+if PHASE != "sample":
+    print(f"skipped: PHASE={PHASE!r} (this cell samples GBIF occurrences)")
+else:
+    from src.data_pipeline import sample_sync
 
-extractor = GBIFExtractor(gbif_cfg)
-# Limit records for a quick pass; drop `max_records=None` to page the full set.
-records = extractor.extract_sync(max_records=500)
-print(f"fetched {len(records)} image-bearing occurrences")
-for r in records[:3]:
-    print(" ", r.lineage.order, "/", r.lineage.family, "/", r.lineage.genus, "/", r.lineage.species)
-'''
-        ),
-        code(
-            '''\
-# --- Option B: spatial clean + H3 range mask (world-scale TSV) --------------
-# Point `tsv_path` at a GBIF occurrence dump (TSV/CSV) if you have one.
-from src.data_pipeline import SpatialProcessor
-
-# sp = SpatialProcessor(h3_cfg)
-# occ = sp.load_occurrences("data/gbif_insecta.tsv")   # streams via DuckDB
-# clean, stats = sp.clean(occ)                          # builds H3 mask + flags outliers
-# print(stats)
-print("Uncomment to run DuckDB spatial cleaning on a full GBIF dump.")
-'''
-        ),
-        md("## 3. Download images (async, fault-tolerant)"),
-        code(
-            '''\
-from src.data_pipeline import ImageDownloader
-
-downloader = ImageDownloader(dl_cfg)
-# Small test slice: only the first SMALL_N records are downloaded.
-# Raise it (or use records directly) for a real run.
-SMALL_N = __SMALL_N__
-result = downloader.download_sync(records[:SMALL_N])
-print(f"from {SMALL_N} records -> ok={result.ok} failed={result.failed} skipped(dup)={result.skipped}")
-'''.replace("__SMALL_N__", str(SMALL_N))
-        ),
-        md("## 4. Curation (integrity / resolution / aspect ratio)"),
-        code(
-            '''\
-from src.data_pipeline import curate_directory
-
-verdicts = curate_directory("data/raw", cur_cfg)
-ok = sum(v.ok for v in verdicts)
-print(f"{ok}/{len(verdicts)} images pass curation")
-for v in verdicts:
-    if not v.ok:
-        print("  drop:", v.path, "->", v.reason)
+    work = Path("meta")
+    src = _input("open-insect-id-v2-meta")
+    if src is not None:
+        # Full snapshot: census + every part sampled so far.
+        shutil.copytree(src, work, dirs_exist_ok=True)
+    census_path = work / "census.parquet"
+    if not census_path.exists():
+        raise SystemExit("census.parquet not found: run PHASE=census first")
+    parts = sample_sync(cfg, census_path, work / "sampling")  # parts are skipped
+    part_files = sorted(parts.glob("part-*.parquet"))
+    n_rows = sum(pl.read_parquet(p).height for p in part_files)
+    print(f"sample: {len(part_files)} parts / {n_rows} candidate rows -> {parts}")
+    _publish("yoanndev90/open-insect-id-v2-meta", work,
+             f"sample: {len(part_files)} parts / {n_rows} rows",
+             "Open Insect ID - Meta")
 '''
         ),
         md(
-            """## 5. Export the curated manifest
+            """## 4. `PHASE="download"` — fill one data shard
 
-Write a Parquet manifest consumed by the training notebook. Schema:
-`image_path, order, family, genus, species` (+ optional `h3_cell, lat, lon`).
-Lineage is re-derived from the curated file tree. On Kaggle, push this as a
-Dataset so notebook 02 can attach it as input.
-"""
+Materialise the previous version of `open-insect-id-v2-data-NN` into the
+working directory (dataset versions are full snapshots), then download this
+shard's species from the sampling index: fetch → curate (224-px floor,
+aspect ≤ 3) → resize to 320 px → q85 JPEG, content-hash named under
+`order/family/genus/species/`, capped at `max_images_per_species`.
+
+Stops cleanly on `DL_BUDGET_MIN` or the 18 GB working-dir guard; the next
+run continues, skipping species that are already full without spending
+network. Finishes by writing the shard manifest, pushing the shard, then
+this shard's manifest part."""
         ),
         code(
             '''\
-import polars as pl
-from pathlib import Path
+if PHASE != "download":
+    print(f"skipped: PHASE={PHASE!r} (this cell fills data-{SHARD:02d})")
+else:
+    from src.data_pipeline import SamplingIndex, download_sync, write_shard_manifest
 
-RAW = Path("data/raw")
-schema = ["image_path", "order", "family", "genus", "species"]
-rows = []
-for v in verdicts:
-    if not v.ok:
-        continue
-    parts = Path(v.path).relative_to(RAW).parts  # order/family/genus/species/hash.jpg
-    if len(parts) == 5:
-        o, f, g, s = parts[:4]
-        rows.append({"image_path": "/".join(parts), "order": o,
-                     "family": f, "genus": g, "species": s})
+    # Read-only inputs: census + sampling index (attached meta, or local meta/).
+    meta = _input("open-insect-id-v2-meta")
+    if meta is None and (Path("meta") / "census.parquet").exists():
+        meta = Path("meta")
+    if meta is None:
+        raise SystemExit("meta not found: attach open-insect-id-v2-meta "
+                         "(or run census + sample locally first)")
 
-manifest = pl.DataFrame(rows, schema={c: pl.Utf8 for c in schema})
-manifest.write_parquet("insectid_manifest.parquet")
-print(f"manifest: {manifest.height} curated rows -> insectid_manifest.parquet")
-# If running on Kaggle, publish manifest + images into the curated dataset
-# (folder must hold dataset-metadata.json with id yoanndev90/open-insect-id-v2):
-#   !kaggle datasets version -m "curated run" -p <dataset-folder> --dir-mode tar
-# notebook 02 already attaches that dataset as an input.
-manifest.head(5)
+    shard_id = f"open-insect-id-v2-data-{SHARD:02d}"
+    work = Path(f"data-{SHARD:02d}")
+    src = _input(shard_id)
+    if src is not None:
+        # Dataset versions are full snapshots: materialise the previous one so
+        # this run continues from exactly the state the last run pushed.
+        shutil.copytree(src, work, dirs_exist_ok=True)
+
+    plan = pl.read_parquet(meta / "shards.parquet")
+    keys = plan.filter(pl.col("shard") == SHARD)["species_key"].to_list()
+    have = sum(p.stat().st_size for p in work.rglob("*.jpg")) if work.exists() else 0
+    print(f"shard {SHARD:02d}: {len(keys)} species, {have / 1e9:.2f} GB on disk")
+
+    index = SamplingIndex(meta / "census.parquet", meta / "sampling",
+                          part_size=cfg.part_species)
+    stats = download_sync(cfg, work, keys, index, budget_min=DL_BUDGET_MIN)
+    print("download:", stats)
+
+    manifest = write_shard_manifest(work)
+    rows = pl.read_parquet(manifest).height
+    print(f"shard manifest: {rows} images -> {manifest}")
+
+    # Shard first: a manifest part that lags behind under-lists images (safe —
+    # the next run heals it); the reverse order could list missing files.
+    _publish(f"yoanndev90/{shard_id}", work,
+             f"shard {SHARD:02d}: +{stats['ok']} images ({rows} total)",
+             f"Open Insect ID - Data {SHARD:02d}")
+    mwork = Path("manifest")
+    msrc = _input("open-insect-id-v2-manifest")
+    if msrc is not None:
+        shutil.copytree(msrc, mwork, dirs_exist_ok=True)
+    mwork.mkdir(exist_ok=True)
+    shutil.copy(manifest, mwork / f"data-{SHARD:02d}.parquet")
+    _publish("yoanndev90/open-insect-id-v2-manifest", mwork,
+             f"part data-{SHARD:02d}: {rows} images", "Open Insect ID - Manifest")
+'''
+        ),
+        md(
+            """## 5. `PHASE="manifest"` — merge the shard manifests
+
+Read every `data-NN.parquet` part from the attached **manifest** dataset,
+merge into `insectid_manifest.parquet` with a `shard` column (the dataset
+slug, for multi-root loading), slug-sorted so train/val splits stay
+reproducible, and republish the **manifest** dataset. Run this once all
+`N_SHARDS` shards report a manifest part."""
+        ),
+        code(
+            '''\
+if PHASE != "manifest":
+    print(f"skipped: PHASE={PHASE!r} (this cell merges the shard manifests)")
+else:
+    from src.data_pipeline import merge_manifests
+
+    work = Path("manifest")
+    src = _input("open-insect-id-v2-manifest")
+    if src is not None:
+        shutil.copytree(src, work, dirs_exist_ok=True)
+    pairs, missing = [], []
+    for i in range(N_SHARDS):
+        name = f"data-{i:02d}"
+        part = work / f"{name}.parquet"
+        if part.exists():
+            pairs.append((name, part))
+        else:
+            missing.append(name)
+    if missing:
+        raise SystemExit(f"missing manifest parts: {missing} — run the download "
+                         f"phase for those shards first")
+    df = merge_manifests(pairs, work / "insectid_manifest.parquet")
+    print(f"merged {len(pairs)} shard parts -> {df.height} images, "
+          f"{df['species'].n_unique()} species, {df['order'].n_unique()} orders")
+    _publish("yoanndev90/open-insect-id-v2-manifest", work,
+             f"merged: {df.height} images / {df['species'].n_unique()} species",
+             "Open Insect ID - Manifest")
 '''
         ),
     ]
@@ -605,6 +746,25 @@ def _slugify(title: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", title.lower())).strip("-")
 
 
+def _pipeline_inputs(phase: str, shard: int, n_shards: int) -> list:
+    """dataset_sources for notebook 01 — one attach set per campaign phase.
+
+    Every referenced dataset must already exist (they are pre-created empty),
+    otherwise Kaggle rejects the kernel submission before any cell runs.
+    """
+    meta = "yoanndev90/open-insect-id-v2-meta"
+    manifest = "yoanndev90/open-insect-id-v2-manifest"
+    if phase == "census":
+        return []  # reads nothing; writes and pushes the meta dataset
+    if phase == "sample":
+        return [meta]
+    if phase == "download":
+        return [meta, f"yoanndev90/open-insect-id-v2-data-{shard:02d}", manifest]
+    if phase == "manifest":
+        return [manifest]
+    raise ValueError(f"unknown PHASE {phase!r} (census|sample|download|manifest)")
+
+
 def _kernel_metadata(title: str, code_file: str, gpu: bool, inputs: list) -> dict:
     """kernel-metadata.json for `kaggle kernels push -p <folder>`.
 
@@ -631,13 +791,18 @@ def _kernel_metadata(title: str, code_file: str, gpu: bool, inputs: list) -> dic
 
 
 def main():
+    if not 0 <= SHARD < N_SHARDS:
+        raise ValueError(f"SHARD must be in 0..{N_SHARDS - 1}, got {SHARD}")
+    # Fails fast on a typo'd phase, before anything is written.
+    pipeline_inputs = _pipeline_inputs(PHASE, SHARD, N_SHARDS)
+
     # slug -> (builder, human title, needs GPU)
     kernels = {
         "01-data-pipeline": (
             lambda: build_pipeline_nb(),
             "Open Insect ID v2 - Data Pipeline",
             False,
-            [],
+            pipeline_inputs,
         ),
         "02-train-moe": (
             lambda: build_train_nb(),
