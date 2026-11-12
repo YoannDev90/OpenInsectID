@@ -631,8 +631,9 @@ def test_gbif_fetcher_gate_adapts_pace_aimd(monkeypatch):
     fetch = gbif_fetcher(sess, GBIFConfig(), interval=0.15)
     assert fetch.gate.interval == 0.15
     run_async(fetch([("q", "a")]))
-    # 4 penalties: 0.15 -> 0.3 -> 0.6 -> 1.2 -> 2.0 (ceiling); 1 relax: /2.
-    assert fetch.gate.interval == 1.0
+    # 4 penalties: 0.15 -> 0.3 -> 0.6 -> 1.2 -> 2.4 (below the 6 s ceiling);
+    # 1 relax on the final success: /2.
+    assert fetch.gate.interval == 1.2
     for _ in range(3):  # plain successes walk the pace back to the base
         run_async(fetch([("q", "a")]))
     assert fetch.gate.interval == 0.15

@@ -110,10 +110,13 @@ def write_parquet_atomic(df: pl.DataFrame, path: str | Path) -> Path:
 
 # GBIF throttles "depending on server load": a 429 is normal, not an error.
 # It gets a patient budget of its own (doubling waits, Retry-After honoured)
-# on top of the regular transient retries, and halves the request pace.
+# on top of the regular transient retries, and halves the request pace. The
+# ceiling matches what GBIF actually accepts from one IP: v6 logged 30k
+# rejections in 9 h pinned at a 2 s ceiling (only ~1 accepted request in 6),
+# so backing off to 6 s keeps the accepted throughput far more politely.
 GBIF_429_TRIES = 5
 GBIF_429_BACKOFF = 10.0  # s before the first 429 retry; doubles each time
-GBIF_MAX_INTERVAL = 2.0  # AIMD ceiling for the gate (base interval 0.15 s)
+GBIF_MAX_INTERVAL = 6.0  # AIMD ceiling for the gate (base interval 0.15 s)
 
 
 class RequestGate:
