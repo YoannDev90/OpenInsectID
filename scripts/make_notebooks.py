@@ -171,13 +171,41 @@ def _publish(slug, folder, message, title):
     # pushes — upgrade it first (same guard as notebook 02).
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
                    check=False)
-    (folder / "dataset-metadata.json").write_text(json.dumps({
-        "title": title,
+    # Seed the metadata file from the dataset's LIVE settings so a version
+    # push never clobbers manual web edits: `datasets version` re-sends
+    # keywords on every push (the only field here the version API reads
+    # besides id), so the defaults below are only a fallback for when the
+    # fetch fails. Subtitle and description are deliberately NOT written:
+    # fields the API does not receive are left untouched server-side (proven
+    # across pushes), and a subtitle over 80 chars would fail validation and
+    # kill the push. File/column descriptions and the cover image are never
+    # sent by `datasets version` either — nothing else can be overwritten.
+    meta = {
         "id": slug,
+        "title": title,
         "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
         # Kaggle keywords are a closed tag list: unknown tags are dropped.
         "keywords": ["classification", "research", "python", "beginner"],
-    }))
+    }
+    live_file = folder / "dataset-metadata.json"
+    fetch = subprocess.run(
+        ["kaggle", "datasets", "metadata", slug, "-p", str(folder)],
+        capture_output=True, text=True,
+    )
+    if fetch.returncode == 0 and live_file.exists():
+        try:
+            live = json.loads(live_file.read_text()).get("info") or {}
+            for key in ("title", "licenses", "keywords"):
+                if live.get(key) is not None:
+                    meta[key] = live[key]
+            print(f"publish {slug}: keeping live settings (title, license, "
+                  f"{len(meta['keywords'])} keywords)")
+        except Exception as exc:
+            print(f"live settings unreadable ({exc}); using defaults")
+    else:
+        print("live settings fetch failed; using defaults |",
+              (fetch.stdout + fetch.stderr).strip())
+    live_file.write_text(json.dumps(meta))
     # -r tar: directories upload uncompressed (images mount as plain files);
     # -t: never rewrite our parquet files to CSV on upload.
     r = subprocess.run(
@@ -597,12 +625,33 @@ if IS_KAGGLE and (out / "last.pt").exists():
         [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
         check=False,
     )
-    (out / "dataset-metadata.json").write_text(json.dumps({
+    # Same web-edit preservation as notebook 01's _publish(): seed the
+    # metadata file from the dataset's live settings (keywords are the one
+    # field a version push re-sends), falling back to the defaults below.
+    # Subtitle/description are never written: fields the API does not
+    # receive stay untouched server-side.
+    ckpt_meta = {
         "title": "Open Insect ID - Checkpoints",
         "id": "yoanndev90/open-insect-id-checkpoints",
         "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
         "keywords": ["classification", "research", "python", "beginner"],
-    }))
+    }
+    _live = subprocess.run(
+        ["kaggle", "datasets", "metadata", ckpt_meta["id"], "-p", str(out)],
+        capture_output=True, text=True,
+    )
+    _live_file = out / "dataset-metadata.json"
+    if _live.returncode == 0 and _live_file.exists():
+        try:
+            info = json.loads(_live_file.read_text()).get("info") or {}
+            for k in ("title", "licenses", "keywords"):
+                if info.get(k) is not None:
+                    ckpt_meta[k] = info[k]
+            print("checkpoints: keeping live settings "
+                  f"({len(ckpt_meta['keywords'])} keywords)")
+        except Exception as exc:
+            print(f"live settings unreadable ({exc}); using defaults")
+    _live_file.write_text(json.dumps(ckpt_meta))
     r = subprocess.run(
         ["kaggle", "datasets", "version", "-p", "checkpoints",
          "-m", f"02-train-moe: {len(history['train'])} epoch(s) this run", "-q"],
