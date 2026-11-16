@@ -9,7 +9,9 @@
   "enable_internet": "true",
   "machine_shape": "",
   "dataset_sources": [
-    "yoanndev90/open-insect-id-v2-meta"
+    "yoanndev90/open-insect-id-v2-meta",
+    "yoanndev90/open-insect-id-v2-data-00",
+    "yoanndev90/open-insect-id-v2-manifest"
   ],
   "competition_sources": [],
   "kernel_sources": [],
