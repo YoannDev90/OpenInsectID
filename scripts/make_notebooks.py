@@ -31,8 +31,9 @@ BUDGET_MIN = 300
 #   download -> fill one shard (SHARD) with images  -> data-NN + manifest
 #   manifest -> merge the per-shard manifest parts  -> manifest dataset
 PHASE = "download"
-SHARD = 1            # 0..N_SHARDS-1: shard filled by the download phase
+SHARD = 2            # 0..N_SHARDS-1: shard filled by the download phase
 RUN_BUDGET_MIN = 540 # wall-clock budget (minutes) for one sample/download run
+FLUSH_MIN = 15       # push shard progress every N minutes during download (0 = only at run end)
 N_SHARDS = 12        # matches CampaignConfig.n_shards and the data-NN datasets
 
 
@@ -130,6 +131,7 @@ def build_pipeline_nb():
 PHASE = __PHASE__# census | sample | download | manifest
 SHARD = __SHARD__# shard filled by the download phase (0..N_SHARDS-1)
 RUN_BUDGET_MIN = __RUN_BUDGET_MIN__# wall-clock budget (minutes) for one sample/download run
+FLUSH_MIN = __FLUSH_MIN__# push download progress every N minutes (0 = only at run end)
 N_SHARDS = __N_SHARDS__# matches CampaignConfig + the data-NN datasets
 
 import json, shutil, subprocess, sys
@@ -167,10 +169,18 @@ def _publish(slug, folder, message, title):
     if not IS_KAGGLE:
         print(f"local run: {folder} not pushed -> {slug}")
         return
-    # The preinstalled CLI (2.0.2) mangles license/keywords on version
-    # pushes — upgrade it first (same guard as notebook 02).
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
-                   check=False)
+    # One-shot per notebook run: flushes call this every FLUSH_MIN minutes,
+    # so the CLI upgrade and the live-settings fetch are cached on the
+    # function itself instead of repeating per push.
+    if not getattr(_publish, "_cli_ready", False):
+        # The preinstalled CLI (2.0.2) mangles license/keywords on version
+        # pushes — upgrade it first (same guard as notebook 02).
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
+                       check=False)
+        _publish._cli_ready = True
+    live_cache = getattr(_publish, "_live", None)
+    if live_cache is None:
+        live_cache = _publish._live = {}
     # Seed the metadata file from the dataset's LIVE settings so a version
     # push never clobbers manual web edits: `datasets version` re-sends
     # keywords on every push (the only field here the version API reads
@@ -180,32 +190,34 @@ def _publish(slug, folder, message, title):
     # across pushes), and a subtitle over 80 chars would fail validation and
     # kill the push. File/column descriptions and the cover image are never
     # sent by `datasets version` either — nothing else can be overwritten.
-    meta = {
-        "id": slug,
-        "title": title,
-        "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
-        # Kaggle keywords are a closed tag list: unknown tags are dropped.
-        "keywords": ["classification", "research", "python", "beginner"],
-    }
-    live_file = folder / "dataset-metadata.json"
-    fetch = subprocess.run(
-        ["kaggle", "datasets", "metadata", slug, "-p", str(folder)],
-        capture_output=True, text=True,
-    )
-    if fetch.returncode == 0 and live_file.exists():
-        try:
-            live = json.loads(live_file.read_text()).get("info") or {}
-            for key in ("title", "licenses", "keywords"):
-                if live.get(key) is not None:
-                    meta[key] = live[key]
-            print(f"publish {slug}: keeping live settings (title, license, "
-                  f"{len(meta['keywords'])} keywords)")
-        except Exception as exc:
-            print(f"live settings unreadable ({exc}); using defaults")
-    else:
-        print("live settings fetch failed; using defaults |",
-              (fetch.stdout + fetch.stderr).strip())
-    live_file.write_text(json.dumps(meta))
+    if slug not in live_cache:
+        meta = {
+            "id": slug,
+            "title": title,
+            "licenses": [{"name": "Attribution 4.0 International (CC BY 4.0)"}],
+            # Kaggle keywords are a closed tag list: unknown tags are dropped.
+            "keywords": ["classification", "research", "python", "beginner"],
+        }
+        live_file = folder / "dataset-metadata.json"
+        fetch = subprocess.run(
+            ["kaggle", "datasets", "metadata", slug, "-p", str(folder)],
+            capture_output=True, text=True,
+        )
+        if fetch.returncode == 0 and live_file.exists():
+            try:
+                live = json.loads(live_file.read_text()).get("info") or {}
+                for key in ("title", "licenses", "keywords"):
+                    if live.get(key) is not None:
+                        meta[key] = live[key]
+                print(f"publish {slug}: keeping live settings (title, license, "
+                      f"{len(meta['keywords'])} keywords)")
+            except Exception as exc:
+                print(f"live settings unreadable ({exc}); using defaults")
+        else:
+            print("live settings fetch failed; using defaults |",
+                  (fetch.stdout + fetch.stderr).strip())
+        live_cache[slug] = meta
+    (folder / "dataset-metadata.json").write_text(json.dumps(live_cache[slug]))
     # -r tar: directories upload uncompressed (images mount as plain files);
     # -t: never rewrite our parquet files to CSV on upload.
     r = subprocess.run(
@@ -219,6 +231,7 @@ def _publish(slug, folder, message, title):
         .replace("__PHASE__", f"{PHASE!r:<26}")
         .replace("__SHARD__", f"{SHARD!r:<26}")
         .replace("__RUN_BUDGET_MIN__", f"{RUN_BUDGET_MIN!r:<18}")
+        .replace("__FLUSH_MIN__", f"{FLUSH_MIN!r:<31}")
         .replace("__N_SHARDS__", f"{N_SHARDS!r:<23}")
     )
     b.cells = [
@@ -344,23 +357,29 @@ else:
 
     index = SamplingIndex(meta / "census.parquet", meta / "sampling",
                           part_size=cfg.part_species)
-    stats = {"ok": 0}  # so the finally below can report a crashed run
-    try:
-        stats = download_sync(cfg, work, keys, index, budget_min=RUN_BUDGET_MIN)
-        print("download:", stats)
-    finally:
-        # Publish on success AND on failure: images already on disk are
-        # never thrown away (a kill mid-push loses at most this run's tail).
+
+    # ------------------------------------------------------------------
+    # ship() publishes shard + manifest part and is idempotent: it skips
+    # the multi-GB upload when nothing changed since the last push. Flushes
+    # call it every FLUSH_MIN minutes and the `finally` below calls it on
+    # success AND on failure, so a killed session loses at most one flush
+    # window instead of the whole run.
+    # ------------------------------------------------------------------
+    shipped = {"rows": None}
+
+    def ship(reason: str):
         work.mkdir(parents=True, exist_ok=True)
         manifest = write_shard_manifest(work)
         rows = pl.read_parquet(manifest).height
+        if rows == shipped["rows"]:
+            print(f"ship skipped ({reason}): {rows} images already published")
+            return
         print(f"shard manifest: {rows} images -> {manifest}")
-
         # Shard first: a manifest part that lags behind under-lists images
         # (safe — the next run heals it); the reverse order could list
         # missing files.
         _publish(f"yoanndev90/{shard_id}", work,
-                 f"shard {SHARD:02d}: +{stats['ok']} images ({rows} total)",
+                 f"shard {SHARD:02d} ({reason}): {rows} images",
                  f"Open Insect ID - Data {SHARD:02d}")
         mwork = Path("manifest")
         msrc = _input("open-insect-id-v2-manifest")
@@ -370,6 +389,22 @@ else:
         shutil.copy(manifest, mwork / f"data-{SHARD:02d}.parquet")
         _publish("yoanndev90/open-insect-id-v2-manifest", mwork,
                  f"part data-{SHARD:02d}: {rows} images", "Open Insect ID - Manifest")
+        shipped["rows"] = rows
+
+    stats = {"ok": 0}  # so the finally below can report a crashed run
+    try:
+        stats = download_sync(
+            cfg, work, keys, index,
+            budget_min=RUN_BUDGET_MIN,
+            flush_every_min=FLUSH_MIN,
+            # run_download calls the flush hook with no arguments.
+            on_flush=lambda: ship("flush"),
+        )
+        print("download:", stats)
+    finally:
+        # Publish on success AND on failure: images already on disk are
+        # never thrown away (idempotent — skips rows a flush just shipped).
+        ship("final")
 '''
         ),
         md(

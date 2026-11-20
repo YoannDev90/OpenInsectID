@@ -681,6 +681,8 @@ async def run_download(
     fetch,
     *,
     budget_min: float = 0.0,
+    flush_every_min: float = 0.0,
+    on_flush=None,
     now=None,
 ) -> dict:
     """Fill one shard: every species up to its cap, resumably.
@@ -688,6 +690,11 @@ async def run_download(
     ``fetch(url) -> bytes | None`` is already rate-limited/retried. Stops
     cleanly on the wall-clock budget or the working-dir byte guard; unvisited
     species stay queued for the next run.
+
+    If *flush_every_min* > 0, *on_flush* is called between species at most
+    that often (via ``asyncio.to_thread`` so downloads keep progressing).
+    The callback should publish shard + manifest progress and be idempotent:
+    nothing is re-uploaded when no new image exists since the last call.
     """
     now = now or time.monotonic
     root = Path(shard_dir)
@@ -700,14 +707,17 @@ async def run_download(
     stats = {
         "ok": 0, "failed": 0, "rejected": 0, "duplicate": 0,
         "skipped_full": 0, "species_done": 0, "bytes": 0, "stop": "",
+        "flushes": 0,
     }
     queue: asyncio.Queue[int] = asyncio.Queue()
     for k in species_keys:
         queue.put_nowait(k)
     incomplete = 0  # popped but unfinished: work for the next run too
+    last_flush = now()
+    flush_lock = asyncio.Lock()
 
     async def worker() -> None:
-        nonlocal incomplete
+        nonlocal incomplete, last_flush
         while not stop.is_set():
             try:
                 key = queue.get_nowait()
@@ -722,6 +732,19 @@ async def run_download(
                 incomplete += 1
                 if guard.reason:
                     stop.set()
+            # Periodic flush between species: publish progress so a killed
+            # session loses at most one flush window instead of the whole
+            # run. Runs in a thread so downloads keep going during the
+            # (potentially multi-GB) upload; image writes are atomic
+            # (tmp + rename), so the snapshot never holds a half-written file.
+            if on_flush and flush_every_min > 0.0:
+                async with flush_lock:
+                    # Re-check under the lock: another worker may have just
+                    # flushed while this one was waiting.
+                    if now() - last_flush >= flush_every_min * 60:
+                        last_flush = now()
+                        stats["flushes"] += 1
+                        await asyncio.to_thread(on_flush)
 
     await asyncio.gather(*(worker() for _ in range(cfg.species_concurrency)))
     stats["bytes"] = guard.bytes
@@ -737,6 +760,8 @@ def download_sync(
     species_keys: list[int],
     index: SamplingIndex,
     budget_min: float = 0.0,
+    flush_every_min: float = 0.0,
+    on_flush=None,
 ) -> dict:
     async def go():
         import aiohttp
@@ -754,7 +779,10 @@ def download_sync(
                 return await dl.fetch(session, url)
 
             return await run_download(
-                cfg, shard_dir, species_keys, index, fetch, budget_min=budget_min
+                cfg, shard_dir, species_keys, index, fetch,
+                budget_min=budget_min,
+                flush_every_min=flush_every_min,
+                on_flush=on_flush,
             )
 
     return run_async(go())

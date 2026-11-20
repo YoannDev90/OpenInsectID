@@ -500,6 +500,37 @@ def test_download_stops_on_wall_clock_budget(tmp_path):
     assert stats["stop"] == "budget"
 
 
+def test_download_flushes_periodically_and_can_be_disabled(tmp_path):
+    """flush_every_min calls on_flush between species; 0 disables it."""
+    cfg, keys, index = _download_env(tmp_path, n_species=3)
+
+    async def fetch(url):
+        return _jpeg(seed=zlib.crc32(url.encode()))
+
+    flushes: list[str] = []
+    tick = [1000.0]
+
+    def now():
+        tick[0] += 1000.0  # +16.7 min per call: the 15-min interval passes
+        return tick[0]     # after a single call (budget is disabled here)
+
+    stats = run_async(
+        run_download(cfg, tmp_path / "shard", keys, index, fetch,
+                     flush_every_min=15, on_flush=lambda: flushes.append("x"),
+                     now=now)
+    )
+    assert stats["flushes"] >= 1
+    assert len(flushes) == stats["flushes"]  # every flush ran the callback
+    assert stats["remaining"] == 0
+
+    # Default: no flush at all, even with a fast clock.
+    flushes.clear()
+    stats = run_async(
+        run_download(cfg, tmp_path / "shard2", keys, index, fetch, now=now)
+    )
+    assert stats["flushes"] == 0 and flushes == []
+
+
 def test_download_is_resumable_mid_species(tmp_path):
     """A killed run keeps its files; the next run only fetches the remainder."""
     cfg, keys, index = _download_env(tmp_path, n_species=1, rows_per_species=6)
