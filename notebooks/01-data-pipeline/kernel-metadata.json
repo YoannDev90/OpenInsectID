@@ -10,7 +10,7 @@
   "machine_shape": "",
   "dataset_sources": [
     "yoanndev90/open-insect-id-v2-meta",
-    "yoanndev90/open-insect-id-v2-data-03",
+    "yoanndev90/open-insect-id-v2-data-04",
     "yoanndev90/open-insect-id-v2-manifest"
   ],
   "competition_sources": [],

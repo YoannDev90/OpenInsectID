@@ -31,7 +31,7 @@ BUDGET_MIN = 300
 #   download -> fill one shard (SHARD) with images  -> data-NN + manifest
 #   manifest -> merge the per-shard manifest parts  -> manifest dataset
 PHASE = "download"
-SHARD = 3            # 0..N_SHARDS-1: shard filled by the download phase
+SHARD = 4            # 0..N_SHARDS-1: shard filled by the download phase
 RUN_BUDGET_MIN = 540 # wall-clock budget (minutes) for one sample/download run
 FLUSH_MIN = 15       # push shard progress every N minutes during download (0 = only at run end)
 N_SHARDS = 12        # matches CampaignConfig.n_shards and the data-NN datasets
